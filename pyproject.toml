@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "twinfolio"
+version = "0.1.0"
+description = "English EPUB in. Facing-page Chinese out."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  "beautifulsoup4",
+  "lxml",
+]
+
+[project.optional-dependencies]
+test = ["pytest"]
+
+[project.scripts]
+twinfolio = "book_translate.cli:main"
+book-translate = "book_translate.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+book_translate = ["prompts/*.json"]
