@@ -1,19 +1,27 @@
-"""LLM chat client: immutable config, per-instance throttle/usage/cache.
+"""LLM chat client: immutable config, per-instance throttle/usage/cache,
+and layered network error handling.
 
 One `LlmClient` is built per `pipeline.translate` run, so two concurrent
 runs in the same process cannot reset each other's token totals or rewrite
 each other's throttle interval (which module-level singletons used to allow).
+
+Errors are typed so the retry loop can tell transient failures (429, 5xx,
+timeouts, connection errors) from permanent ones (other 4xx), which are
+raised immediately instead of burning retries against a rejected request.
 """
 from __future__ import annotations
 
+import email.utils
 import hashlib
 import json
 import os
+import random
 import threading
 import time
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -28,6 +36,95 @@ class LlmConfig:
     api_key: str
     model: str
     reasoning_effort: str = "low"
+
+
+class LlmError(RuntimeError):
+    """Base for LLM transport/protocol failures.
+
+    Subclasses RuntimeError so callers that caught the old opaque
+    RuntimeError keep working.
+    """
+
+
+class LlmHttpError(LlmError):
+    """HTTP-level failure with its status code preserved.
+
+    Also used when a 200 response carries an error payload that names an
+    HTTP-like status code (common with gateways).
+    """
+
+    def __init__(self, code: int, body: str = "", retry_after: float | None = None):
+        super().__init__(f"HTTP {code}: {body[:240]}")
+        self.code = code
+        self.body = body
+        self.retry_after = retry_after
+
+    @property
+    def retryable(self) -> bool:
+        return self.code == 429 or self.code >= 500
+
+
+class LlmProtocolError(LlmError):
+    """Malformed or error-carrying response without a usable status code
+    (non-JSON body, or a 200 whose error payload names no HTTP code).
+    Treated as transient: gateways emit these for upstream hiccups."""
+
+
+def _is_retryable(exc: BaseException) -> bool:
+    """Transient failures only: 429/5xx, gateway protocol noise, timeouts,
+    and connection-level errors. Everything else (400/401/403/404, coding
+    bugs) fails fast."""
+    if isinstance(exc, LlmHttpError):
+        return exc.retryable
+    if isinstance(exc, LlmProtocolError):
+        return True
+    if isinstance(exc, urllib.error.HTTPError):  # pragma: no cover - normally wrapped
+        return exc.code == 429 or exc.code >= 500
+    # URLError covers DNS/connection failures; TimeoutError and other
+    # OSErrors can escape response.read() unwrapped.
+    return isinstance(exc, (urllib.error.URLError, TimeoutError, OSError))
+
+
+def _parse_retry_after(headers: object) -> float | None:
+    """Seconds to wait from a Retry-After header: delta-seconds or HTTP-date."""
+    get = getattr(headers, "get", None)
+    value = get("Retry-After") if callable(get) else None
+    if not value:
+        return None
+    value = str(value).strip()
+    try:
+        seconds = float(value)
+    except ValueError:
+        try:
+            dt = email.utils.parsedate_to_datetime(value)
+        except (TypeError, ValueError):
+            return None
+        if dt is None:
+            return None
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        seconds = (dt - datetime.now(timezone.utc)).total_seconds()
+    return max(0.0, seconds) if seconds == seconds else None  # reject NaN
+
+
+def _error_code(err: dict) -> int | None:
+    """HTTP-like status code from an error payload, if it names one."""
+    for key in ("code", "status", "status_code"):
+        try:
+            code = int(err.get(key))  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            continue
+        if 100 <= code <= 599:
+            return code
+    return None
+
+
+def _backoff_seconds(attempt: int, retry_after: float | None = None) -> float:
+    """Exponential backoff with jitter; honors Retry-After when it is longer."""
+    base = 2.0 * (attempt + 1)
+    if retry_after is not None and retry_after > 0:
+        base = max(base, retry_after)
+    return base + random.uniform(0.0, base / 4)
 
 
 class TokenUsage:
@@ -226,10 +323,27 @@ class LlmClient:
         )
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                data = json.loads(r.read().decode())
+                raw = r.read().decode()
         except urllib.error.HTTPError as e:
-            raw = e.read().decode("utf-8", errors="replace")
-            raise RuntimeError(f"HTTP {e.code}: {raw[:240]}") from e
+            detail = e.read().decode("utf-8", errors="replace")
+            raise LlmHttpError(
+                e.code, detail, retry_after=_parse_retry_after(e.headers)
+            ) from e
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as e:
+            raise LlmProtocolError(f"non-JSON response body: {raw[:240]}") from e
+        if not isinstance(data, dict):
+            raise LlmProtocolError(f"unexpected response shape: {raw[:240]}")
+        err = data.get("error")
+        if isinstance(err, dict):
+            # gateways report upstream failures as HTTP 200 + {"error": ...};
+            # an empty content here is a failure, not a legitimate answer
+            message = str(err.get("message") or err)[:240]
+            code = _error_code(err)
+            if code is not None:
+                raise LlmHttpError(code, message)
+            raise LlmProtocolError(f"gateway error: {message}")
         choice = (data.get("choices") or [{}])[0]
         content = ((choice.get("message") or {}).get("content") or "").strip()
         finish = choice.get("finish_reason") or ""
@@ -247,10 +361,16 @@ class LlmClient:
         log: Callable[[str], None] | None = None,
         source: str = "",
     ) -> str:
-        """One-shot chat completion with exponential-backoff retries.
+        """One-shot chat completion with jittered exponential-backoff retries.
+
+        Only transient failures (429, 5xx, timeouts, connection errors) are
+        retried; other 4xx raise immediately. A 429's Retry-After header
+        stretches the backoff when it asks for more than the schedule.
 
         If the reply was cut off (finish_reason == "length"), retry once with
-        a doubled token budget and keep the longer answer.
+        a doubled token budget and keep the longer answer. A reply that is
+        still truncated after that is returned but never cached, so a later
+        run can retry instead of hitting the truncation forever.
 
         `self.cache` is a paragraph-level store keyed by sha1(model + prompt +
         normalized source). Changing the model or prompt is a miss.
@@ -277,18 +397,21 @@ class LlmClient:
                     bumped = dict(body, max_tokens=min(max_tokens * 2, 16000))
                     try:
                         self.throttle.wait()
-                        content2, _ = self._chat_once(bumped, timeout)
+                        content2, finish2 = self._chat_once(bumped, timeout)
                         if len(content2) > len(content):
-                            content = content2
-                    except Exception:
-                        pass
-                if self.cache is not None and content:
+                            content, finish = content2, finish2
+                    except Exception as e:  # noqa: BLE001 - keep the first answer
+                        if log:
+                            log(f"chat length-bump retry failed, keeping truncated answer: {e}")
+                if self.cache is not None and content and finish != "length":
                     self.cache.put(model, prompt, content, source)
                 return content
-            except Exception as e:  # noqa: BLE001 - network layer, retry everything
+            except Exception as e:  # noqa: BLE001 - classified below
+                if not _is_retryable(e):
+                    raise
                 last = e
                 if log:
                     log(f"chat attempt {attempt + 1}/{retries} failed: {e}")
                 if attempt + 1 < retries:
-                    time.sleep(2 * (attempt + 1))
-        raise RuntimeError(f"chat failed after {retries} attempts: {last}") from last
+                    time.sleep(_backoff_seconds(attempt, getattr(e, "retry_after", None)))
+        raise LlmError(f"chat failed after {retries} attempts: {last}") from last
