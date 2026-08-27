@@ -2,24 +2,26 @@ import json
 import random
 import threading
 import time
+from dataclasses import replace
 
-from book_translate._util import LlmCache, TOKEN_USAGE, _chat_once, chat
+from book_translate.llm import LlmCache, LlmClient, LlmConfig, TokenUsage
 
 
-API = {"base_url": "http://unit.test/v1", "api_key": "k", "model": "m", "reasoning_effort": ""}
+CFG = LlmConfig(base_url="http://unit.test/v1", api_key="k", model="m", reasoning_effort="")
 
 
 def test_cache_hit_skips_chat(tmp_path, monkeypatch):
     cache = LlmCache(tmp_path / "llm-cache.jsonl")
     calls = {"n": 0}
 
-    def fake_once(api, body, timeout):
+    def fake_once(self, body, timeout):
         calls["n"] += 1
         return "译文甲", "stop"
 
-    monkeypatch.setattr("book_translate._util._chat_once", fake_once)
-    first = chat(API, "把这段译成中文：hello world", cache=cache, source="hello world")
-    second = chat(API, "把这段译成中文：hello world", cache=cache, source="hello world")
+    monkeypatch.setattr(LlmClient, "_chat_once", fake_once)
+    client = LlmClient(CFG, cache=cache)
+    first = client.chat("把这段译成中文：hello world", source="hello world")
+    second = client.chat("把这段译成中文：hello world", source="hello world")
     assert first == second == "译文甲"
     assert calls["n"] == 1
 
@@ -29,15 +31,16 @@ def test_prompt_or_model_change_is_a_miss(tmp_path, monkeypatch):
     replies = iter(["一", "二", "三"])
     calls = {"n": 0}
 
-    def fake_once(api, body, timeout):
+    def fake_once(self, body, timeout):
         calls["n"] += 1
         return next(replies), "stop"
 
-    monkeypatch.setattr("book_translate._util._chat_once", fake_once)
-    chat(API, "prompt-A\nhello", cache=cache, source="hello")
-    other_model = dict(API, model="other-model")
-    chat(other_model, "prompt-A\nhello", cache=cache, source="hello")
-    chat(API, "prompt-B\nhello", cache=cache, source="hello")
+    monkeypatch.setattr(LlmClient, "_chat_once", fake_once)
+    client = LlmClient(CFG, cache=cache)
+    other_model = LlmClient(replace(CFG, model="other-model"), cache=cache)
+    client.chat("prompt-A\nhello", source="hello")
+    other_model.chat("prompt-A\nhello", source="hello")
+    client.chat("prompt-B\nhello", source="hello")
     assert calls["n"] == 3
 
 
@@ -59,12 +62,13 @@ def test_empty_and_half_written_cache_are_ignored(tmp_path, monkeypatch):
 
     calls = {"n": 0}
 
-    def fake_once(api, body, timeout):
+    def fake_once(self, body, timeout):
         calls["n"] += 1
         return "新译文", "stop"
 
-    monkeypatch.setattr("book_translate._util._chat_once", fake_once)
-    assert chat(API, "missing-prompt", cache=cache, source="src") == "新译文"
+    monkeypatch.setattr(LlmClient, "_chat_once", fake_once)
+    client = LlmClient(CFG, cache=cache)
+    assert client.chat("missing-prompt", source="src") == "新译文"
     assert calls["n"] == 1
 
 
@@ -143,7 +147,7 @@ def test_cache_put_shared_instance_is_thread_safe(tmp_path):
             assert loaded.get("m", f"p{tid}-{j}", f"s{tid}-{j}") == f"r{tid}-{j}"
 
 
-def test_chat_once_records_usage(monkeypatch):
+def test_chat_once_records_usage_on_client(monkeypatch):
     class Resp:
         def __enter__(self):
             return self
@@ -159,24 +163,24 @@ def test_chat_once_records_usage(monkeypatch):
                 }
             ).encode()
 
-    monkeypatch.setattr("book_translate._util.urllib.request.urlopen", lambda *a, **k: Resp())
-    TOKEN_USAGE.reset()
-    content, finish = _chat_once(API, {"model": "m"}, 10)
+    monkeypatch.setattr("book_translate.llm.urllib.request.urlopen", lambda *a, **k: Resp())
+    client = LlmClient(CFG)
+    content, finish = client._chat_once({"model": "m"}, 10)
     assert content == "你好"
     assert finish == "stop"
-    assert TOKEN_USAGE.input_tokens == 11
-    assert TOKEN_USAGE.output_tokens == 7
-    assert TOKEN_USAGE.total_tokens == 18
-    assert TOKEN_USAGE.calls == 1
-    assert "input=11" in TOKEN_USAGE.format_line()
+    assert client.usage.input_tokens == 11
+    assert client.usage.output_tokens == 7
+    assert client.usage.total_tokens == 18
+    assert client.usage.calls == 1
+    assert "input=11" in client.usage.format_line()
 
 
 def test_token_usage_accepts_input_output_aliases():
-    TOKEN_USAGE.reset()
-    TOKEN_USAGE.add_from_response({"usage": {"input_tokens": 2, "output_tokens": 3}})
-    assert TOKEN_USAGE.input_tokens == 2
-    assert TOKEN_USAGE.output_tokens == 3
-    assert TOKEN_USAGE.total_tokens == 5
-    assert TOKEN_USAGE.calls == 1
-    TOKEN_USAGE.add_from_response({"choices": []})
-    assert TOKEN_USAGE.calls == 1
+    usage = TokenUsage()
+    usage.add_from_response({"usage": {"input_tokens": 2, "output_tokens": 3}})
+    assert usage.input_tokens == 2
+    assert usage.output_tokens == 3
+    assert usage.total_tokens == 5
+    assert usage.calls == 1
+    usage.add_from_response({"choices": []})
+    assert usage.calls == 1

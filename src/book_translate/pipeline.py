@@ -7,10 +7,11 @@ import zipfile
 from pathlib import Path
 
 from . import file_resume
-from ._util import LlmCache, TOKEN_USAGE, warn_zip_member_names
+from ._util import warn_zip_member_names
 from .dedupe_epub import rewrite as dedupe_epub
 from .derive import derive_zh
 from .glossary import load_glossary
+from .llm import LlmCache, LlmClient, LlmConfig
 from .title_postprocess import fix_english_titles
 from .toc_repair import repair_epub_toc
 
@@ -19,7 +20,7 @@ def _log(msg: str) -> None:
     print(msg, flush=True)
 
 
-def _api() -> dict[str, str]:
+def _api() -> LlmConfig:
     key = os.environ.get("OPENAI_API_KEY") or os.environ.get("BBM_OPENAI_API_KEY") or ""
     if not key:
         raise RuntimeError("set OPENAI_API_KEY (OpenAI-compatible)")
@@ -31,12 +32,12 @@ def _api() -> dict[str, str]:
     ).strip()
     if "3.7" in model and effort.lower() in {"minimal", "none", "min"}:
         effort = "low"
-    return {
-        "api_key": key,
-        "base_url": (os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/"),
-        "model": model,
-        "reasoning_effort": effort,
-    }
+    return LlmConfig(
+        base_url=(os.environ.get("OPENAI_BASE_URL") or "https://api.openai.com/v1").rstrip("/"),
+        api_key=key,
+        model=model,
+        reasoning_effort=effort,
+    )
 
 
 def _reuse_resume_checkpoint(resumed: Path, state_path: Path, src: Path) -> bool:
@@ -73,10 +74,9 @@ def translate(
     out_dir.mkdir(parents=True, exist_ok=True)
     work = out_dir / f".work-{src.stem}"
     work.mkdir(parents=True, exist_ok=True)
-    api = _api()
-    TOKEN_USAGE.reset()
     glossary = load_glossary(work / "glossary.json")
     cache = LlmCache(work / "llm-cache.jsonl")
+    client = LlmClient(_api(), cache=cache)
     warn_zip_member_names(src, _log)
     short_names = file_resume.short_batch_basenames(src)
     if context_paragraphs < 1:
@@ -107,13 +107,12 @@ def translate(
         src,
         bilingual,
         resumed if not testing else work / f"{src.stem}_bilingual-test.epub",
-        api=api,
+        client=client,
         log=_log,
         state_path=None if testing else state_path,
         short_names=short_names,
         short_n=short_n,
         glossary=glossary,
-        cache=cache,
         only_files=only_files,
         retranslate=retranslate,
         test_num=test_num,
@@ -128,7 +127,7 @@ def translate(
         repair_epub_toc(sample)
         _log(f"dedupe test removed={removed}")
         result = {"test": sample}
-        _log(TOKEN_USAGE.format_line())
+        _log(client.usage.format_line())
         _log("done " + " ".join(f"{k}={v}" for k, v in result.items()))
         return result
 
@@ -136,13 +135,9 @@ def translate(
     fix_english_titles(
         bilingual,
         out_path=titled,
-        base_url=api["base_url"],
-        api_key=api["api_key"],
-        model=api["model"],
-        reasoning_effort=api["reasoning_effort"],
+        client=client,
         log_path=work / "title.log",
         glossary=glossary,
-        cache=cache,
     )
     deduped = out_dir / f"{src.stem}-中英双语.epub"
     removed = dedupe_epub(titled, deduped)
@@ -156,19 +151,15 @@ def translate(
         fix_english_titles(
             zh_raw,
             out_path=zh_titled,
-            base_url=api["base_url"],
-            api_key=api["api_key"],
-            model=api["model"],
-            reasoning_effort=api["reasoning_effort"],
+            client=client,
             log_path=work / "title-zh.log",
             glossary=glossary,
-            cache=cache,
         )
         zh_out = out_dir / f"{src.stem}-中文.epub"
         removed_zh = dedupe_epub(zh_titled, zh_out)
         repair_epub_toc(zh_out)
         _log(f"dedupe zh removed={removed_zh}")
         result["zh"] = zh_out
-    _log(TOKEN_USAGE.format_line())
+    _log(client.usage.format_line())
     _log("done " + " ".join(f"{k}={v}" for k, v in result.items()))
     return result

@@ -9,8 +9,20 @@ from bs4 import BeautifulSoup
 
 from book_translate import file_resume
 from book_translate.glossary import Term
+from book_translate.llm import LlmClient, LlmConfig
 
-API = {"base_url": "http://unit.test/v1", "api_key": "k", "model": "m", "reasoning_effort": ""}
+CFG = LlmConfig(base_url="http://unit.test/v1", api_key="k", model="m", reasoning_effort="")
+
+
+class StubClient(LlmClient):
+    """LlmClient whose chat() routes to a test function; throttle/usage stay real."""
+
+    def __init__(self, fn):
+        super().__init__(CFG)
+        self._fn = fn
+
+    def chat(self, prompt, **kwargs):
+        return self._fn(prompt, **kwargs)
 
 OPF = """<?xml version="1.0"?>
 <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
@@ -35,7 +47,7 @@ BETA_TEXT = "Neural networks consist of many layers of neurons."
 _ITEM_RE = re.compile(r"^(\d+)\. (.+)$", re.M)
 
 
-def _echo_chat(api, prompt, **kwargs):
+def _echo_chat(prompt, **kwargs):
     """Deterministic fake LLM: answers numbered lists by echoing the source."""
     lines = [f"{m.group(1)}. 中文（{m.group(2)[:24]}）" for m in _ITEM_RE.finditer(prompt)]
     return "\n".join(lines) if lines else "中文译文内容"
@@ -56,7 +68,7 @@ def _read(epub: Path, name: str) -> str:
         return z.read(name).decode("utf-8")
 
 
-def test_resume_survives_interrupted_rerun(tmp_path, monkeypatch):
+def test_resume_survives_interrupted_rerun(tmp_path):
     """H1/M1: translate half, crash, rerun from the checkpoint - nothing lost."""
     src = _make_src(tmp_path)
     base = tmp_path / "base.epub"
@@ -64,14 +76,15 @@ def test_resume_survives_interrupted_rerun(tmp_path, monkeypatch):
     resumed = tmp_path / "resumed.epub"
     state = tmp_path / "resume-done.json"
 
-    def chat_run1(api, prompt, **kwargs):
+    def chat_run1(prompt, **kwargs):
         if "Neural networks" in prompt:
             raise RuntimeError("network down")
-        return _echo_chat(api, prompt)
+        return _echo_chat(prompt)
 
-    monkeypatch.setattr(file_resume, "chat", chat_run1)
     with pytest.raises(RuntimeError):
-        file_resume.resume_missing(src, base, resumed, api=API, log=lambda m: None, state_path=state)
+        file_resume.resume_missing(
+            src, base, resumed, client=StubClient(chat_run1), log=lambda m: None, state_path=state
+        )
 
     # checkpoint after file 1 exists, state is bound to it and lists only file 1
     assert resumed.exists()
@@ -83,12 +96,13 @@ def test_resume_survives_interrupted_rerun(tmp_path, monkeypatch):
     # rerun the way the pipeline does after the fix: base is the checkpoint itself
     prompts2: list[str] = []
 
-    def chat_run2(api, prompt, **kwargs):
+    def chat_run2(prompt, **kwargs):
         prompts2.append(prompt)
-        return _echo_chat(api, prompt)
+        return _echo_chat(prompt)
 
-    monkeypatch.setattr(file_resume, "chat", chat_run2)
-    out, done = file_resume.resume_missing(src, resumed, resumed, api=API, log=lambda m: None, state_path=state)
+    out, done = file_resume.resume_missing(
+        src, resumed, resumed, client=StubClient(chat_run2), log=lambda m: None, state_path=state
+    )
 
     alpha = _read(out, "EPUB/Text/alpha.xhtml")
     beta = _read(out, "EPUB/Text/beta.xhtml")
@@ -99,10 +113,10 @@ def test_resume_survives_interrupted_rerun(tmp_path, monkeypatch):
     assert "EPUB/Text/beta.xhtml" in done
 
 
-def test_stale_or_legacy_state_does_not_block_translation(tmp_path, monkeypatch):
+def test_stale_or_legacy_state_does_not_block_translation(tmp_path):
     """H1: a done list bound to a different base (or legacy format) is discarded."""
     src = _make_src(tmp_path)
-    monkeypatch.setattr(file_resume, "chat", _echo_chat)
+    client = StubClient(_echo_chat)
 
     # stale dict state pointing at some other base
     base1 = tmp_path / "base1.epub"
@@ -113,7 +127,7 @@ def test_stale_or_legacy_state_does_not_block_translation(tmp_path, monkeypatch)
         encoding="utf-8",
     )
     out1 = tmp_path / "out1.epub"
-    file_resume.resume_missing(src, base1, out1, api=API, log=lambda m: None, state_path=state1)
+    file_resume.resume_missing(src, base1, out1, client=client, log=lambda m: None, state_path=state1)
     assert "中文（The quick" in _read(out1, "EPUB/Text/alpha.xhtml")
     assert "中文（Neural networks" in _read(out1, "EPUB/Text/beta.xhtml")
 
@@ -123,12 +137,12 @@ def test_stale_or_legacy_state_does_not_block_translation(tmp_path, monkeypatch)
     state2 = tmp_path / "state2.json"
     state2.write_text(json.dumps(["alpha.xhtml", "beta.xhtml"]), encoding="utf-8")
     out2 = tmp_path / "out2.epub"
-    file_resume.resume_missing(src, base2, out2, api=API, log=lambda m: None, state_path=state2)
+    file_resume.resume_missing(src, base2, out2, client=client, log=lambda m: None, state_path=state2)
     assert "中文（The quick" in _read(out2, "EPUB/Text/alpha.xhtml")
     assert "中文（Neural networks" in _read(out2, "EPUB/Text/beta.xhtml")
 
 
-def test_translate_batch_number_variants_and_multiline(monkeypatch):
+def test_translate_batch_number_variants_and_multiline():
     """M5: "1." "1、" "1)" formats parse; multi-line answers join instead of truncating."""
     items = ["alpha one text", "beta two text", "gamma three text", "delta four text"]
     responses = iter(
@@ -139,12 +153,11 @@ def test_translate_batch_number_variants_and_multiline(monkeypatch):
     )
     calls: list[dict] = []
 
-    def fake(api, prompt, **kwargs):
+    def fake(prompt, **kwargs):
         calls.append(kwargs)
         return next(responses)
 
-    monkeypatch.setattr(file_resume, "chat", fake)
-    out = file_resume._translate_batch(API, items)
+    out = file_resume._translate_batch(StubClient(fake), items)
     assert out[0] == "译文一"
     assert out[1] == "译文二"
     assert out[2] == "译文三继续 仍是第三条"
@@ -153,9 +166,8 @@ def test_translate_batch_number_variants_and_multiline(monkeypatch):
     assert calls[1]["max_tokens"] >= 1000
 
 
-def test_insertion_keeps_structure_and_ids_unique(monkeypatch):
+def test_insertion_keeps_structure_and_ids_unique():
     """M6: td/ol-li get in-place <br/>+译文; copied blocks drop their id."""
-    monkeypatch.setattr(file_resume, "chat", _echo_chat)
     html = (
         '<html><body>'
         '<table><tr><td id="c1">English cell content sits here.</td></tr></table>'
@@ -163,7 +175,9 @@ def test_insertion_keeps_structure_and_ids_unique(monkeypatch):
         '<p id="p1">Standalone english paragraph content.</p>'
         "</body></html>"
     )
-    out = file_resume.translate_html(html, api=API, log=lambda m: None, fname="c.xhtml")
+    out = file_resume.translate_html(
+        html, client=StubClient(_echo_chat), log=lambda m: None, fname="c.xhtml"
+    )
     soup = BeautifulSoup(out, "html.parser")
 
     tds = soup.find_all("td")
@@ -259,19 +273,20 @@ def test_short_batch_basenames_skips_chapters(tmp_path):
     assert names == {"Index.xhtml", "toc.xhtml"}
 
 
-def test_translate_batch_injects_only_appearing_terms_and_restores(monkeypatch):
+def test_translate_batch_injects_only_appearing_terms_and_restores():
     glossary = [
         Term("Sharpe ratio", "夏普比率", ("Sharpe",)),
         Term("absent-term", "缺席术语"),
     ]
     prompts: list[str] = []
 
-    def fake(api, prompt, **kwargs):
+    def fake(prompt, **kwargs):
         prompts.append(prompt)
         return "1. 计算 @@BT0@@ 即可"
 
-    monkeypatch.setattr(file_resume, "chat", fake)
-    out = file_resume._translate_batch(API, ["Compute the Sharpe ratio first."], glossary=glossary)
+    out = file_resume._translate_batch(
+        StubClient(fake), ["Compute the Sharpe ratio first."], glossary=glossary
+    )
     assert out == ["计算 夏普比率 即可"]
     assert "Sharpe ratio" in prompts[0]
     assert "缺席术语" not in prompts[0]
@@ -279,20 +294,21 @@ def test_translate_batch_injects_only_appearing_terms_and_restores(monkeypatch):
     assert "【术语表】" in prompts[0]
 
 
-def test_translate_html_skips_terms_only_inside_code(monkeypatch):
+def test_translate_html_skips_terms_only_inside_code():
     glossary = [Term("Transformer", "变换器")]
     prompts: list[str] = []
 
-    def fake(api, prompt, **kwargs):
+    def fake(prompt, **kwargs):
         prompts.append(prompt)
         return "1. 请看代码示例"
 
-    monkeypatch.setattr(file_resume, "chat", fake)
     html = (
         "<html><body><p>Please see the sample "
         "<code>Transformer</code> listed here.</p></body></html>"
     )
-    file_resume.translate_html(html, api=API, log=lambda m: None, fname="c.xhtml", glossary=glossary)
+    file_resume.translate_html(
+        html, client=StubClient(fake), log=lambda m: None, fname="c.xhtml", glossary=glossary
+    )
     assert prompts
     assert "【术语表】" not in prompts[0]
     assert "变换器" not in prompts[0]
@@ -390,7 +406,7 @@ def test_patch_opf_keeps_full_path_for_same_basename():
     assert file_resume.spine_hrefs(out) == ["Text/ch1.xhtml", "Notes/ch1.xhtml"]
 
 
-def test_resume_inserts_missing_chapter_in_source_spine_order(tmp_path, monkeypatch):
+def test_resume_inserts_missing_chapter_in_source_spine_order(tmp_path):
     ncx = (
         '<?xml version="1.0"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">'
         "<navMap><navPoint id=\"n1\" playOrder=\"1\"><navLabel><text>Alpha</text></navLabel>"
@@ -414,9 +430,8 @@ def test_resume_inserts_missing_chapter_in_source_spine_order(tmp_path, monkeypa
         z.writestr("EPUB/Text/alpha.xhtml", _zh_pair(ALPHA_TEXT))
         z.writestr("EPUB/Text/beta.xhtml", _zh_pair(BETA_TEXT))
 
-    monkeypatch.setattr(file_resume, "chat", _echo_chat)
     out = tmp_path / "out.epub"
-    file_resume.resume_missing(src, bi, out, api=API, log=lambda m: None, workers=1)
+    file_resume.resume_missing(src, bi, out, client=StubClient(_echo_chat), log=lambda m: None, workers=1)
     opf = _read(out, "EPUB/content.opf")
     assert file_resume.spine_hrefs(opf) == [
         "Text/cover.xhtml",
@@ -432,22 +447,22 @@ def test_resume_inserts_missing_chapter_in_source_spine_order(tmp_path, monkeypa
     assert 'toc="ncx"' in opf
 
 
-def test_resume_workers_1_matches_serial_done_order(tmp_path, monkeypatch):
+def test_resume_workers_1_matches_serial_done_order(tmp_path):
     src = _make_src(tmp_path)
-    monkeypatch.setattr(file_resume, "chat", _echo_chat)
+    client = StubClient(_echo_chat)
     base = tmp_path / "base.epub"
     shutil.copy2(src, base)
     out1 = tmp_path / "out1.epub"
     out2 = tmp_path / "out2.epub"
-    _o1, done1 = file_resume.resume_missing(src, base, out1, api=API, log=lambda m: None, workers=1)
+    _o1, done1 = file_resume.resume_missing(src, base, out1, client=client, log=lambda m: None, workers=1)
     shutil.copy2(src, base)
-    _o2, done2 = file_resume.resume_missing(src, base, out2, api=API, log=lambda m: None)
+    _o2, done2 = file_resume.resume_missing(src, base, out2, client=client, log=lambda m: None)
     assert done1 == done2 == ["EPUB/Text/alpha.xhtml", "EPUB/Text/beta.xhtml"]
     assert "中文（The quick" in _read(out1, "EPUB/Text/alpha.xhtml")
     assert "中文（Neural networks" in _read(out1, "EPUB/Text/beta.xhtml")
 
 
-def test_resume_workers_parallel_writes_then_marks_done(tmp_path, monkeypatch):
+def test_resume_workers_parallel_writes_then_marks_done(tmp_path):
     import time
 
     src = tmp_path / "book3.epub"
@@ -465,13 +480,12 @@ def test_resume_workers_parallel_writes_then_marks_done(tmp_path, monkeypatch):
     out = tmp_path / "out3.epub"
     state = tmp_path / "resume-done.json"
 
-    def fake(api, prompt, **kwargs):
+    def fake(prompt, **kwargs):
         time.sleep(0.05)
-        return _echo_chat(api, prompt)
+        return _echo_chat(prompt)
 
-    monkeypatch.setattr(file_resume, "chat", fake)
     _path, done = file_resume.resume_missing(
-        src, base, out, api=API, log=lambda m: None, state_path=state, workers=3
+        src, base, out, client=StubClient(fake), log=lambda m: None, state_path=state, workers=3
     )
     assert set(done) == {
         "EPUB/Text/alpha.xhtml",
@@ -491,22 +505,21 @@ def test_resume_workers_parallel_writes_then_marks_done(tmp_path, monkeypatch):
     ]
 
 
-def test_resume_workers_do_not_mark_done_before_file_exists(tmp_path, monkeypatch):
+def test_resume_workers_do_not_mark_done_before_file_exists(tmp_path):
     src = _make_src(tmp_path)
     base = tmp_path / "base.epub"
     shutil.copy2(src, base)
     out = tmp_path / "out.epub"
     state = tmp_path / "resume-done.json"
 
-    def boom(api, prompt, **kwargs):
+    def boom(prompt, **kwargs):
         if "Neural networks" in prompt:
             raise RuntimeError("network down")
-        return _echo_chat(api, prompt)
+        return _echo_chat(prompt)
 
-    monkeypatch.setattr(file_resume, "chat", boom)
     with pytest.raises(RuntimeError):
         file_resume.resume_missing(
-            src, base, out, api=API, log=lambda m: None, state_path=state, workers=2
+            src, base, out, client=StubClient(boom), log=lambda m: None, state_path=state, workers=2
         )
     data = json.loads(state.read_text(encoding="utf-8"))
     assert "EPUB/Text/beta.xhtml" not in data["done"]
@@ -532,18 +545,19 @@ def test_job_matches_basename_and_path():
     assert not file_resume.job_matches("EPUB/Text/ch01.html", "ch01.html", ["ch02.html"])
 
 
-def test_translate_html_keeps_single_head_title(monkeypatch):
+def test_translate_html_keeps_single_head_title():
     """<head> must keep exactly one <title>; translating it is title_postprocess's job.
 
     Inserting a translated sibling used to yield <title>EN</title><title>ZH</title>,
     which is invalid XHTML (epubcheck: head requires exactly one title).
     """
-    monkeypatch.setattr(file_resume, "chat", _echo_chat)
     html = (
         "<html><head><title>My Great Book Chapter</title></head>"
         f"<body><p>{ALPHA_TEXT}</p></body></html>"
     )
-    out = file_resume.translate_html(html, api=API, log=lambda m: None, fname="c.xhtml")
+    out = file_resume.translate_html(
+        html, client=StubClient(_echo_chat), log=lambda m: None, fname="c.xhtml"
+    )
     soup = BeautifulSoup(out, "html.parser")
     titles = soup.head.find_all("title")
     assert len(titles) == 1, "head must keep exactly one <title>"
@@ -551,14 +565,13 @@ def test_translate_html_keeps_single_head_title(monkeypatch):
     assert "中文（The quick" in soup.body.get_text(), "body translation must still happen"
 
 
-def test_translate_html_respects_max_blocks(monkeypatch):
+def test_translate_html_respects_max_blocks():
     prompts: list[str] = []
 
-    def fake(api, prompt, **kwargs):
+    def fake(prompt, **kwargs):
         prompts.append(prompt)
-        return _echo_chat(api, prompt)
+        return _echo_chat(prompt)
 
-    monkeypatch.setattr(file_resume, "chat", fake)
     html = (
         "<html><body>"
         "<p>The quick brown fox jumps over the lazy dog today.</p>"
@@ -567,7 +580,7 @@ def test_translate_html_respects_max_blocks(monkeypatch):
         "</body></html>"
     )
     out = file_resume.translate_html(
-        html, api=API, log=lambda m: None, fname="c.xhtml", max_blocks=1
+        html, client=StubClient(fake), log=lambda m: None, fname="c.xhtml", max_blocks=1
     )
     soup = BeautifulSoup(out, "html.parser")
     assert "Neural networks" in soup.get_text()
@@ -576,14 +589,13 @@ def test_translate_html_respects_max_blocks(monkeypatch):
     assert len(prompts) == 1
 
 
-def test_translate_html_sends_rolling_context(monkeypatch):
+def test_translate_html_sends_rolling_context():
     prompts: list[str] = []
 
-    def fake(api, prompt, **kwargs):
+    def fake(prompt, **kwargs):
         prompts.append(prompt)
-        return _echo_chat(api, prompt)
+        return _echo_chat(prompt)
 
-    monkeypatch.setattr(file_resume, "chat", fake)
     html = (
         "<html><body>"
         "<p>The quick brown fox jumps over the lazy dog today.</p>"
@@ -592,7 +604,7 @@ def test_translate_html_sends_rolling_context(monkeypatch):
     )
     file_resume.translate_html(
         html,
-        api=API,
+        client=StubClient(fake),
         log=lambda m: None,
         fname="c.xhtml",
         batch_size=1,
@@ -606,33 +618,32 @@ def test_translate_html_sends_rolling_context(monkeypatch):
     assert "中文（The quick" in prompts[1]
 
 
-def test_resume_only_and_retranslate(tmp_path, monkeypatch):
-    monkeypatch.setattr(file_resume, "chat", _echo_chat)
+def test_resume_only_and_retranslate(tmp_path):
+    client = StubClient(_echo_chat)
     src = _make_src(tmp_path)
     base = tmp_path / "base.epub"
     shutil.copy2(src, base)
     out = tmp_path / "out.epub"
     file_resume.resume_missing(
-        src, base, out, api=API, log=lambda m: None, only_files="beta.xhtml", workers=1
+        src, base, out, client=client, log=lambda m: None, only_files="beta.xhtml", workers=1
     )
     assert "中文（Neural" in _read(out, "EPUB/Text/beta.xhtml")
     assert "中文（The quick" not in _read(out, "EPUB/Text/alpha.xhtml")
 
     file_resume.resume_missing(
-        src, out, out, api=API, log=lambda m: None, retranslate="beta.xhtml", workers=1
+        src, out, out, client=client, log=lambda m: None, retranslate="beta.xhtml", workers=1
     )
     assert "中文（Neural" in _read(out, "EPUB/Text/beta.xhtml")
 
 
-def test_resume_test_num_does_not_write_done(tmp_path, monkeypatch):
-    monkeypatch.setattr(file_resume, "chat", _echo_chat)
+def test_resume_test_num_does_not_write_done(tmp_path):
     src = _make_src(tmp_path)
     base = tmp_path / "base.epub"
     shutil.copy2(src, base)
     out = tmp_path / "out.epub"
     state = tmp_path / "resume-done.json"
     _path, done = file_resume.resume_missing(
-        src, base, out, api=API, log=lambda m: None, state_path=state, test_num=1
+        src, base, out, client=StubClient(_echo_chat), log=lambda m: None, state_path=state, test_num=1
     )
     assert done == []
     assert not state.exists()

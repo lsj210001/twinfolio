@@ -20,9 +20,6 @@ from typing import Callable
 from bs4 import BeautifulSoup, Tag
 
 from ._util import (
-    CHAT_THROTTLE,
-    LlmCache,
-    chat,
     cn_en_counts,
     decode_bytes,
     has_zh_follow,
@@ -33,6 +30,7 @@ from ._util import (
     write_text_utf8,
 )
 from .glossary import Term, apply_glossary, restore_text, visible_text
+from .llm import LlmClient
 
 # <title> is deliberately excluded: translate_html inserts translations as
 # siblings, which would leave two <title> elements in <head> (invalid XHTML,
@@ -478,11 +476,10 @@ def _format_context(pairs: list[tuple[str, str]]) -> str:
 
 
 def _translate_batch(
-    api: dict[str, str],
+    client: LlmClient,
     items: list[str],
     *,
     glossary: list[Term] | None = None,
-    cache: LlmCache | None = None,
     match_texts: list[str] | None = None,
     context: list[tuple[str, str]] | None = None,
 ) -> list[str]:
@@ -497,12 +494,10 @@ def _translate_batch(
         "1. 译文\n2. 译文\n"
         "只输出编号列表，不要解释，不要合并或拆分段落。\n\n" + "\n".join(lines)
     )
-    raw = chat(
-        api,
+    raw = client.chat(
         prompt,
         max_tokens=min(8000, 180 * len(items) + 400),
         timeout=90,
-        cache=cache,
         source="\n".join(items),
     )
     parsed = parse_numbered_lines(raw)
@@ -512,12 +507,10 @@ def _translate_batch(
         if zh:
             out.append(restore_text(zh, maps[i - 1], appearing))
             continue
-        single = chat(
-            api,
+        single = client.chat(
             prefix + "把这段英文译成简体中文，只输出译文：\n" + protected[i - 1],
             max_tokens=max(1000, 3 * len(src)),
             timeout=90,
-            cache=cache,
             source=src,
         )
         single = " ".join(single.split()).strip().strip("\"“”")
@@ -547,14 +540,13 @@ def batch_token_budget(
 def translate_html(
     html: str,
     *,
-    api: dict[str, str],
+    client: LlmClient,
     log: Callable[[str], None],
     fname: str,
     batch_size: int | None = None,
     short_names: set[str] | None = None,
     short_n: int = SHORT_BATCH,
     glossary: list[Term] | None = None,
-    cache: LlmCache | None = None,
     max_blocks: int | None = None,
     use_context: bool = False,
     context_paragraphs: int = DEFAULT_CONTEXT_PARAGRAPHS,
@@ -601,10 +593,9 @@ def translate_html(
         chunk = texts[start:end]
         log(f"resume {fname}: {start + 1}-{end}/{len(texts)}")
         zhs = _translate_batch(
-            api,
+            client,
             chunk,
             glossary=glossary,
-            cache=cache,
             match_texts=visibles[start:end],
             context=ctx if use_context else None,
         )
@@ -841,14 +832,13 @@ def resume_missing(
     bilingual: Path,
     out: Path,
     *,
-    api: dict[str, str],
+    client: LlmClient,
     log: Callable[[str], None],
     progress: Callable[[str], None] | None = None,
     state_path: Path | None = None,
     short_names: set[str] | None = None,
     short_n: int = SHORT_BATCH,
     glossary: list[Term] | None = None,
-    cache: LlmCache | None = None,
     workers: int | None = None,
     only_files: str | list[str] | None = None,
     retranslate: str | list[str] | None = None,
@@ -910,13 +900,12 @@ def resume_missing(
     ) -> str:
         return translate_html(
             src_html,
-            api=api,
+            client=client,
             log=log_fn,
             fname=base,
             short_names=short_names,
             short_n=short_n,
             glossary=glossary,
-            cache=cache,
             max_blocks=max_blocks,
             use_context=use_context,
             context_paragraphs=context_paragraphs,
@@ -959,8 +948,11 @@ def resume_missing(
 
     splice_lock = threading.Lock()
     current = [bilingual]
-    prev_gap = CHAT_THROTTLE.min_interval
-    CHAT_THROTTLE.min_interval = max(prev_gap, _RESUME_CHAT_GAP_SEC)
+    # Raise the gap only on this client's throttle for the parallel section;
+    # other clients in the process are unaffected.
+    throttle = client.throttle
+    prev_gap = throttle.min_interval
+    throttle.min_interval = max(prev_gap, _RESUME_CHAT_GAP_SEC)
     errors: list[BaseException] = []
     try:
         with ThreadPoolExecutor(max_workers=workers) as pool:
@@ -986,7 +978,7 @@ def resume_missing(
                     if write_state and state_path:
                         _write_state(state_path, out, done, src)
     finally:
-        CHAT_THROTTLE.min_interval = prev_gap
+        throttle.min_interval = prev_gap
     if errors:
         raise errors[0]
     return out, done

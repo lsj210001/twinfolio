@@ -3,6 +3,7 @@ import zipfile
 from pathlib import Path
 
 from book_translate import file_resume, pipeline
+from book_translate.llm import LlmClient
 
 
 def _tiny_epub(path: Path, payload: bytes = b"x" * 1200) -> Path:
@@ -37,10 +38,11 @@ def test_seed_bilingual_copies_source(tmp_path):
 
 def test_translate_uses_file_resume_not_bbook(tmp_path, monkeypatch):
     src = _tiny_epub(tmp_path / "book.epub")
-    seen: dict[str, Path] = {}
+    seen: dict[str, object] = {}
 
     def fake_resume(src_epub, bilingual, resumed, **kwargs):
         seen["bilingual"] = Path(bilingual)
+        seen["client"] = kwargs.get("client")
         shutil.copy2(bilingual, resumed)
         return resumed, []
 
@@ -54,12 +56,19 @@ def test_translate_uses_file_resume_not_bbook(tmp_path, monkeypatch):
     monkeypatch.setattr(pipeline, "repair_epub_toc", lambda p: None)
     monkeypatch.setenv("OPENAI_API_KEY", "k")
     monkeypatch.delenv("BBM_OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("BOOK_TRANSLATE_MODEL", raising=False)
+    monkeypatch.delenv("MODEL", raising=False)
 
     out = tmp_path / "out"
     result = pipeline.translate(src, out, bilingual_only=True)
     assert result["bilingual"].is_file()
     assert seen["bilingual"].name == "book_bilingual.epub"
     assert zipfile.is_zipfile(seen["bilingual"])
+    client = seen["client"]
+    assert isinstance(client, LlmClient)
+    assert client.config.model == "gpt-4o-mini"
+    assert client.cache is not None
+    assert client.usage.calls == 0, "a fresh client must start with zero usage"
     assert not hasattr(pipeline, "_run_bbook")
     assert not hasattr(pipeline, "_bbm_bin")
 

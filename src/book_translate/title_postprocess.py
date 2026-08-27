@@ -20,8 +20,9 @@ from typing import Optional
 
 from bs4 import BeautifulSoup, NavigableString
 
-from ._util import LlmCache, chat, cn_en_counts, decode_bytes, has_zh_follow, norm as _norm, parse_numbered_lines, read_text, rezip, write_text_utf8
+from ._util import cn_en_counts, decode_bytes, has_zh_follow, norm as _norm, parse_numbered_lines, read_text, rezip, write_text_utf8
 from .glossary import Term, apply_glossary, restore_text
+from .llm import LlmClient
 
 _has_zh_follow = has_zh_follow
 
@@ -94,14 +95,10 @@ def _collect_titles_from_epub(epub_path: Path) -> list[str]:
 def _translate_titles(
     titles: list[str],
     *,
-    base_url: str,
-    api_key: str,
-    model: str,
-    reasoning_effort: str = "minimal",
+    client: LlmClient,
     batch_size: int = 40,
     log_path: Optional[Path] = None,
     glossary: list[Term] | None = None,
-    cache: LlmCache | None = None,
 ) -> dict[str, str]:
     mapping: dict[str, str] = {}
     if not titles:
@@ -114,12 +111,6 @@ def _translate_titles(
             with open(log_path, "a", encoding="utf-8") as f:
                 f.write(line + "\n")
 
-    api = {
-        "base_url": base_url,
-        "api_key": api_key,
-        "model": model,
-        "reasoning_effort": reasoning_effort,
-    }
     terms = glossary or []
     for i in range(0, len(titles), batch_size):
         batch = titles[i : i + batch_size]
@@ -141,7 +132,7 @@ def _translate_titles(
         )
         part: dict[str, str] = {}
         try:
-            raw = chat(api, prompt, max_tokens=4000, log=log, cache=cache, source="\n".join(batch))
+            raw = client.chat(prompt, max_tokens=4000, log=log, source="\n".join(batch))
             for idx, zh in parse_numbered_lines(raw).items():
                 if 1 <= idx <= len(batch) and zh:
                     part[batch[idx - 1]] = restore_text(zh, maps[idx - 1], appearing)
@@ -152,12 +143,10 @@ def _translate_titles(
         for t in missing:
             try:
                 j = batch.index(t)
-                zh = chat(
-                    api,
+                zh = client.chat(
                     prefix + f"把这个英文标题译成简洁自然的简体中文标题，只输出中文标题本身：\n{protected[j]}",
                     max_tokens=max(1000, 3 * len(t)),
                     log=log,
-                    cache=cache,
                     source=t,
                 )
                 zh = " ".join(zh.split()).strip().strip("\"“”")
@@ -278,14 +267,10 @@ def fix_english_titles(
     epub_path: Path,
     *,
     out_path: Optional[Path] = None,
-    base_url: str,
-    api_key: str,
-    model: str,
-    reasoning_effort: str = "minimal",
+    client: LlmClient,
     log_path: Optional[Path] = None,
     map_path: Optional[Path] = None,
     glossary: list[Term] | None = None,
-    cache: LlmCache | None = None,
 ) -> Path:
     """Translate leftover English titles and write a fixed EPUB.
 
@@ -312,13 +297,9 @@ def fix_english_titles(
 
     mapping = _translate_titles(
         titles,
-        base_url=base_url,
-        api_key=api_key,
-        model=model,
-        reasoning_effort=reasoning_effort,
+        client=client,
         log_path=log_path,
         glossary=glossary,
-        cache=cache,
     )
     log(f"{epub_path.name}: mapped {len(mapping)}/{len(titles)}")
     if map_path:
@@ -338,21 +319,26 @@ if __name__ == "__main__":
     import argparse
     import os
 
+    from .llm import LlmConfig
+
     ap = argparse.ArgumentParser(description="Fix English titles in an EPUB")
     ap.add_argument("epub")
     ap.add_argument("-o", "--output", default="")
     ap.add_argument("--map", default="")
     args = ap.parse_args()
 
-    out = fix_english_titles(
-        Path(args.epub),
-        out_path=Path(args.output) if args.output else None,
+    config = LlmConfig(
         base_url=os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1"),
         api_key=os.environ.get("OPENAI_API_KEY", ""),
         model=os.environ.get("BOOK_TRANSLATE_MODEL") or os.environ.get("MODEL", "gpt-4o-mini"),
         reasoning_effort=os.environ.get("BOOK_TRANSLATE_REASONING_EFFORT")
         or os.environ.get("BBM_REASONING_EFFORT")
         or "low",
+    )
+    out = fix_english_titles(
+        Path(args.epub),
+        out_path=Path(args.output) if args.output else None,
+        client=LlmClient(config),
         map_path=Path(args.map) if args.map else None,
     )
     print(out)
