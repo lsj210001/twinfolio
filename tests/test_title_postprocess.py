@@ -3,7 +3,37 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup
 
-from book_translate.title_postprocess import _apply_mapping_zip, _force_replace_element
+from book_translate.title_postprocess import (
+    _apply_mapping_zip,
+    _collect_titles_from_epub,
+    _force_replace_element,
+)
+
+
+def test_head_title_collected_and_replaced_in_place(tmp_path: Path):
+    """A leftover English <head><title> is picked up and replaced in place,
+    keeping exactly one <title> (file-resume must no longer duplicate it)."""
+    epub = tmp_path / "book.epub"
+    chapter = (
+        "<html><head><title>My Great Book Chapter</title></head>"
+        "<body><p>正文段落已经翻译好了。</p></body></html>"
+    )
+    with zipfile.ZipFile(epub, "w") as z:
+        z.writestr("mimetype", "application/epub+zip", zipfile.ZIP_STORED)
+        z.writestr("EPUB/Text/ch1.xhtml", chapter)
+
+    assert "My Great Book Chapter" in _collect_titles_from_epub(epub)
+
+    out = tmp_path / "out.epub"
+    n = _apply_mapping_zip(epub, {"My Great Book Chapter": "我的好书章节"}, out)
+    assert n == 1
+
+    with zipfile.ZipFile(out) as z:
+        got = z.read("EPUB/Text/ch1.xhtml").decode("utf-8")
+    soup = BeautifulSoup(got, "html.parser")
+    titles = soup.find_all("title")
+    assert len(titles) == 1
+    assert titles[0].get_text() == "我的好书章节"
 
 
 def test_toc_li_replacement_keeps_link(tmp_path: Path):

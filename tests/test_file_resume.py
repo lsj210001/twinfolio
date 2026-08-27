@@ -532,6 +532,25 @@ def test_job_matches_basename_and_path():
     assert not file_resume.job_matches("EPUB/Text/ch01.html", "ch01.html", ["ch02.html"])
 
 
+def test_translate_html_keeps_single_head_title(monkeypatch):
+    """<head> must keep exactly one <title>; translating it is title_postprocess's job.
+
+    Inserting a translated sibling used to yield <title>EN</title><title>ZH</title>,
+    which is invalid XHTML (epubcheck: head requires exactly one title).
+    """
+    monkeypatch.setattr(file_resume, "chat", _echo_chat)
+    html = (
+        "<html><head><title>My Great Book Chapter</title></head>"
+        f"<body><p>{ALPHA_TEXT}</p></body></html>"
+    )
+    out = file_resume.translate_html(html, api=API, log=lambda m: None, fname="c.xhtml")
+    soup = BeautifulSoup(out, "html.parser")
+    titles = soup.head.find_all("title")
+    assert len(titles) == 1, "head must keep exactly one <title>"
+    assert titles[0].get_text() == "My Great Book Chapter"
+    assert "中文（The quick" in soup.body.get_text(), "body translation must still happen"
+
+
 def test_translate_html_respects_max_blocks(monkeypatch):
     prompts: list[str] = []
 

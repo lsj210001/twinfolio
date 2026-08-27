@@ -34,7 +34,10 @@ from ._util import (
 )
 from .glossary import Term, apply_glossary, restore_text, visible_text
 
-TAGS = ["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "td", "th", "title", "small", "blockquote"]
+# <title> is deliberately excluded: translate_html inserts translations as
+# siblings, which would leave two <title> elements in <head> (invalid XHTML,
+# epubcheck error). Title translation is title_postprocess's job.
+TAGS = ["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "td", "th", "small", "blockquote"]
 EXCLUDE = {"code", "pre", "sup"}
 SHORT_NAME_RE = re.compile(
     r"(references?|bibliograph(?:y|ies)|index|endnotes?|footnotes?|notes|toc|nav|contents)\.(xhtml|html|htm)$",
