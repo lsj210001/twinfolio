@@ -260,6 +260,10 @@ class LlmCache:
     def __init__(self, path: Path):
         self.path = Path(path)
         self._mem: dict[str, str] = {}
+        # In-process lock for _mem: resume workers share one instance, and a
+        # put() must not mutate _mem while another thread iterates it. The
+        # `.lock` file below only serializes writers across processes.
+        self._mem_lock = threading.Lock()
         self._load()
 
     @staticmethod
@@ -296,23 +300,30 @@ class LlmCache:
                 self._mem[key] = response
 
     def get(self, model: str, prompt: str, source: str = "") -> str | None:
-        return self._mem.get(self.make_key(model, prompt, source))
+        key = self.make_key(model, prompt, source)
+        with self._mem_lock:
+            return self._mem.get(key)
 
     def put(self, model: str, prompt: str, response: str, source: str = "") -> None:
         if not response:
             return
         key = self.make_key(model, prompt, source)
-        self._mem[key] = response
+        with self._mem_lock:
+            self._mem[key] = response
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
         with _exclusive_lock(self.path.with_name(self.path.name + ".lock")):
-            if self.path.is_file():
-                disk = LlmCache(self.path)
-                disk._mem.update(self._mem)
-                self._mem = disk._mem
+            disk = LlmCache(self.path) if self.path.is_file() else None
+            # Merge and snapshot under the thread lock so no other thread can
+            # resize _mem mid-iteration; serialize the snapshot outside it.
+            with self._mem_lock:
+                if disk is not None:
+                    disk._mem.update(self._mem)
+                    self._mem = disk._mem
+                snapshot = dict(self._mem)
             payload = "".join(
                 json.dumps({"key": k, "response": v}, ensure_ascii=False) + "\n"
-                for k, v in self._mem.items()
+                for k, v in snapshot.items()
             )
             try:
                 tmp.write_text(payload, encoding="utf-8")

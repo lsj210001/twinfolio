@@ -1,5 +1,7 @@
 import json
+import random
 import threading
+import time
 
 from book_translate._util import LlmCache, TOKEN_USAGE, _chat_once, chat
 
@@ -102,6 +104,43 @@ def test_cache_put_serializes_writers(tmp_path):
     for line in lines:
         json.loads(line)
     assert len(LlmCache(path)._mem) == 8
+
+
+def test_cache_put_shared_instance_is_thread_safe(tmp_path):
+    """Resume workers share one LlmCache; concurrent put() on that instance
+    must not crash (dict mutated while another thread iterates it) and must
+    not lose entries. The random sleeps scatter each thread's put across the
+    other threads' payload-building windows to make the race reproducible."""
+    path = tmp_path / "llm-cache.jsonl"
+    cache = LlmCache(path)
+    prefill = 3000
+    for i in range(prefill):
+        cache._mem[f"prefill-{i:05d}"] = "值" * 20
+    puts_per_thread = 25
+    errors: list[BaseException] = []
+    start = threading.Barrier(4)
+
+    def worker(tid: int) -> None:
+        rnd = random.Random(tid)
+        try:
+            start.wait()
+            for j in range(puts_per_thread):
+                time.sleep(rnd.random() * 0.004)
+                cache.put("m", f"p{tid}-{j}", f"r{tid}-{j}", f"s{tid}-{j}")
+        except BaseException as e:  # noqa: BLE001 - collect for the parent thread
+            errors.append(e)
+
+    threads = [threading.Thread(target=worker, args=(t,)) for t in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, f"concurrent put raised: {errors[:3]}"
+    loaded = LlmCache(path)
+    assert len(loaded._mem) == prefill + 4 * puts_per_thread
+    for tid in range(4):
+        for j in range(puts_per_thread):
+            assert loaded.get("m", f"p{tid}-{j}", f"s{tid}-{j}") == f"r{tid}-{j}"
 
 
 def test_chat_once_records_usage(monkeypatch):
