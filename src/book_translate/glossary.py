@@ -8,6 +8,7 @@ import json
 import os
 import re
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 
 from bs4 import BeautifulSoup, NavigableString, Tag
@@ -38,6 +39,7 @@ def variants(term: Term) -> list[str]:
     return out
 
 
+@lru_cache(maxsize=None)
 def _boundary_re(variant: str) -> re.Pattern[str]:
     esc = re.escape(variant)
     if re.match(r"^[A-Za-z0-9]", variant) and re.search(r"[A-Za-z0-9]$", variant):
@@ -45,14 +47,51 @@ def _boundary_re(variant: str) -> re.Pattern[str]:
     return re.compile(esc)
 
 
+@dataclass(frozen=True, eq=False)
+class CompiledTerm:
+    """A term with its variants sorted longest-first and patterns precompiled.
+
+    Holding pattern objects directly sidesteps `re`'s 512-entry compile cache,
+    which thrashes once a glossary (sources + aliases) exceeds ~512 variants.
+    """
+
+    term: Term
+    variants: tuple[str, ...]
+    patterns: tuple[re.Pattern[str], ...]
+    maxlen: int
+
+
+@lru_cache(maxsize=None)
+def _compile_term(term: Term) -> CompiledTerm:
+    vs = tuple(variants(term))
+    pats = tuple(_boundary_re(v) for v in vs)
+    return CompiledTerm(term, vs, pats, len(vs[0]) if vs else 0)
+
+
 def term_in(text: str, term: Term) -> bool:
     if not text:
         return False
-    return any(_boundary_re(v).search(text) for v in variants(term))
+    return any(p.search(text) for p in _compile_term(term).patterns)
 
 
 def appearing_terms(texts: list[str], terms: list[Term]) -> list[Term]:
-    return [t for t in terms if any(term_in(text, t) for text in texts)]
+    non_empty = [t for t in texts if t]
+    if not non_empty or not terms:
+        return []
+    # Coarse prefilter: one search over the joined haystack per pattern. The
+    # "\n" separator never extends an alnum run, so any per-text match also
+    # matches the haystack (no false negatives); rare join-spanning hits are
+    # weeded out by the exact per-text pass below.
+    haystack = non_empty[0] if len(non_empty) == 1 else "\n".join(non_empty)
+    exact = len(non_empty) == 1
+    out: list[Term] = []
+    for term in terms:
+        ct = _compile_term(term)
+        if not any(p.search(haystack) for p in ct.patterns):
+            continue
+        if exact or any(p.search(t) for p in ct.patterns for t in non_empty):
+            out.append(term)
+    return out
 
 
 PROMPT_HINT_BUDGET = 3500
@@ -104,29 +143,34 @@ def inject_glossary_into_prompt(prompt: dict, terms: list[Term]) -> dict:
     return out
 
 
-def protect_text(text: str, terms: list[Term], *, start: int = 0) -> tuple[str, list[tuple[str, str]]]:
-    """Replace appearing source/alias spans with placeholders. Longer first."""
-    if not text or not terms:
-        return text, []
-    ordered = sorted(terms, key=lambda t: max((len(v) for v in variants(t)), default=0), reverse=True)
+def _ordered_compiled(terms: list[Term]) -> list[CompiledTerm]:
+    """Compile and sort longest-variant-first (stable, like the original sort)."""
+    return sorted((_compile_term(t) for t in terms), key=lambda ct: ct.maxlen, reverse=True)
+
+
+def _protect_ordered(
+    text: str, ordered: list[CompiledTerm], start: int
+) -> tuple[str, list[tuple[str, str]]]:
     mapping: list[tuple[str, str]] = []
     result = text
     i = start
-    for term in ordered:
-        matched = False
-        for v in variants(term):
-            pat = _boundary_re(v)
+    for ct in ordered:
+        for pat in ct.patterns:
             if not pat.search(result):
                 continue
             ph = _PLACEHOLDER.format(i=i)
             result = pat.sub(ph, result)
-            mapping.append((ph, term.target))
+            mapping.append((ph, ct.term.target))
             i += 1
-            matched = True
             break
-        if not matched:
-            continue
     return result, mapping
+
+
+def protect_text(text: str, terms: list[Term], *, start: int = 0) -> tuple[str, list[tuple[str, str]]]:
+    """Replace appearing source/alias spans with placeholders. Longer first."""
+    if not text or not terms:
+        return text, []
+    return _protect_ordered(text, _ordered_compiled(terms), start)
 
 
 def restore_text(text: str, mapping: list[tuple[str, str]], terms: list[Term] | None = None) -> str:
@@ -137,12 +181,12 @@ def restore_text(text: str, mapping: list[tuple[str, str]], terms: list[Term] | 
     for ph, target in mapping:
         out = out.replace(ph, target)
     if terms:
-        leftover = sorted(terms, key=lambda t: max((len(v) for v in variants(t)), default=0), reverse=True)
-        for term in leftover:
-            for v in variants(term):
-                if v == term.target:
+        for ct in _ordered_compiled(terms):
+            target = ct.term.target
+            for v, pat in zip(ct.variants, ct.patterns):
+                if v == target:
                     continue
-                out = _boundary_re(v).sub(term.target, out)
+                out = pat.sub(target, out)
     return out
 
 
@@ -177,6 +221,7 @@ def protect_html(
     """Placeholder-lock terms in HTML text nodes, leaving EXCLUDE tags alone."""
     soup = BeautifulSoup(html, "html.parser")
     appearing = appearing_terms([visible_text(soup, exclude)], terms)
+    ordered = _ordered_compiled(appearing)
     mapping: list[tuple[str, str]] = []
     idx = 0
     for node in list(soup.descendants):
@@ -184,7 +229,10 @@ def protect_html(
             continue
         if _inside_exclude(node, exclude):
             continue
-        new, local = protect_text(str(node), appearing, start=idx)
+        text = str(node)
+        if not text or not ordered:
+            continue
+        new, local = _protect_ordered(text, ordered, idx)
         if not local:
             continue
         node.replace_with(new)
@@ -211,10 +259,15 @@ def apply_glossary(
     haystacks = match_texts if match_texts is not None else items
     appearing = appearing_terms(list(haystacks), terms)
     hint = format_hint(appearing)
+    ordered = _ordered_compiled(appearing)
     protected: list[str] = []
     maps: list[list[tuple[str, str]]] = []
     for it in items:
-        p, m = protect_text(it, appearing)
+        if not it or not ordered:
+            protected.append(it)
+            maps.append([])
+            continue
+        p, m = _protect_ordered(it, ordered, 0)
         protected.append(p)
         maps.append(m)
     return protected, maps, hint, appearing
@@ -267,7 +320,10 @@ def load_glossary(path: Path) -> list[Term]:
             data = json.loads(raw)
         except json.JSONDecodeError:
             return []
-        return _parse_terms(data)
+        terms = _parse_terms(data)
+        for t in terms:
+            _compile_term(t)
+        return terms
     path.parent.mkdir(parents=True, exist_ok=True)
     payload = json.dumps({"terms": []}, ensure_ascii=False, indent=2) + "\n"
     tmp = path.with_name(path.name + ".tmp")
