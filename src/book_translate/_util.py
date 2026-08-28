@@ -17,16 +17,24 @@ from bs4 import Tag
 # text helpers
 
 
+_WS_RE = re.compile(r"\s+")
+_CJK = re.compile(r"[\u4e00-\u9fff]+")
+# U+0130 (İ) and U+212A (KELVIN SIGN) are the only non-ASCII codepoints whose
+# str.lower() lands in a-z, so the previous per-character
+# `"a" <= ch.lower() <= "z"` test counted them; keep exact parity.
+_LATIN = re.compile(r"[A-Za-z\u0130\u212a]+")
+
+
 def norm(s: str) -> str:
     """Collapse whitespace/nbsp/zwsp and fold curly quotes to straight ones."""
     s = (s or "").replace("\xa0", " ").replace("\u200b", "")
-    s = re.sub(r"\s+", " ", s).strip()
+    s = _WS_RE.sub(" ", s).strip()
     return s.replace("’", "'").replace("‘", "'").replace("“", '"').replace("”", '"')
 
 
 def cn_en_counts(text: str) -> tuple[int, int]:
-    cn = sum(1 for ch in text if "\u4e00" <= ch <= "\u9fff")
-    en = sum(1 for ch in text if "a" <= ch.lower() <= "z")
+    cn = sum(map(len, _CJK.findall(text)))
+    en = sum(map(len, _LATIN.findall(text)))
     return cn, en
 
 

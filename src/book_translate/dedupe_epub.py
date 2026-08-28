@@ -20,14 +20,20 @@ BLOCK = ["p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "td", "th", "blockquote"
 # candidates themselves.
 _NEVER_REMOVE = {"td", "th"}
 
+_WS_RE = re.compile(r"\s+")
+_CHAPTER_NO_RE = re.compile(r"第\s*(\d+)\s*章")
+_PUNCT_RE = re.compile(r"[“”\"'《》·，,。．.：:；;、()\s]")
+_FULLWIDTH_PAREN_RE = re.compile(r"（[^）]*）")
+_ASCII_PAREN_RE = re.compile(r"\([^)]*\)")
+
 
 def _norm(text: str) -> str:
     """Aggressive normalization for duplicate detection only."""
     t = text.replace("\xa0", " ")
-    t = re.sub(r"\s+", " ", t).strip()
-    t = re.sub(r"第\s*(\d+)\s*章", r"第\1章", t)
+    t = _WS_RE.sub(" ", t).strip()
+    t = _CHAPTER_NO_RE.sub(r"第\1章", t)
     t = t.replace("作者：", "").replace("作者:", "")
-    t = re.sub(r"[“”\"'《》·，,。．.：:；;、()\s]", "", t)
+    t = _PUNCT_RE.sub("", t)
     return t.lower()
 
 
@@ -37,9 +43,9 @@ def _cite_no(text: str) -> str | None:
 
 
 def _core(text: str) -> str:
-    t = re.sub(r"\s+", " ", text).strip()
-    t = re.sub(r"（[^）]*）", "", t)
-    t = re.sub(r"\([^)]*\)", "", t)
+    t = _WS_RE.sub(" ", text).strip()
+    t = _FULLWIDTH_PAREN_RE.sub("", t)
+    t = _ASCII_PAREN_RE.sub("", t)
     return _norm(t)
 
 
