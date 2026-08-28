@@ -968,8 +968,7 @@ def resume_missing(
     try:
         with zipfile.ZipFile(bilingual) as zin:
             zin.extractall(workdir)
-        opfs = list(workdir.rglob("*.opf"))
-        opf_path = opfs[0] if opfs else None
+        opf_path = find_opf_in_tree(workdir)
         opf_rel = str(opf_path.relative_to(workdir)).replace("\\", "/") if opf_path else ""
 
         def _commit(dest: str, html: str) -> None:
