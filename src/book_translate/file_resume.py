@@ -11,6 +11,7 @@ import shutil
 import tempfile
 import threading
 import time
+import warnings
 import zipfile
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import copy
@@ -800,6 +801,36 @@ def splice(
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def _append_members(prev: Path, out: Path, entries: list[tuple[str, bytes]]) -> None:
+    """Cheap per-file checkpoint: copy the previous EPUB and append the changed
+    members. Copying compressed bytes is far cheaper than splice()'s
+    extractall+rezip, which inflates and re-deflates every member of the book
+    for each finished file (O(files^2) over a whole resume).
+
+    Appended names shadow earlier duplicates for zip readers, so the
+    checkpoint stays a valid resume base; the single clean rezip at the end of
+    resume_missing removes the shadowed duplicates. Writes go to a temp file
+    that atomically replaces `out`, so a crash mid-checkpoint never corrupts
+    the previous checkpoint.
+    """
+    tmp = out.with_name(out.name + ".ckpt")
+    try:
+        shutil.copy2(prev, tmp)
+        with warnings.catch_warnings():
+            # shadowing an existing member is the whole point here
+            warnings.filterwarnings("ignore", message="Duplicate name:", category=UserWarning)
+            with zipfile.ZipFile(tmp, "a", zipfile.ZIP_DEFLATED) as z:
+                for rel, data in entries:
+                    z.writestr(rel, data)
+        os.replace(tmp, out)
+    finally:
+        if tmp.exists():
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
+
+
 def _fingerprint(path: Path) -> str:
     h = hashlib.sha1()
     with open(path, "rb") as f:
@@ -808,10 +839,21 @@ def _fingerprint(path: Path) -> str:
     return h.hexdigest()
 
 
-def _write_state(state_path: Path, base: Path, done: list[str], src: Path | None = None) -> None:
+def _write_state(
+    state_path: Path,
+    base: Path,
+    done: list[str],
+    src: Path | None = None,
+    *,
+    src_sha1: str | None = None,
+) -> None:
+    """`src_sha1` may be passed pre-computed; src never changes during a run,
+    so callers in per-file loops should hash it once instead of every file."""
     payload: dict = {"base_sha1": _fingerprint(base), "done": done}
-    if src is not None:
-        payload["src_sha1"] = _fingerprint(src)
+    if src_sha1 is None and src is not None:
+        src_sha1 = _fingerprint(src)
+    if src_sha1 is not None:
+        payload["src_sha1"] = src_sha1
     tmp = state_path.with_name(state_path.name + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, state_path)
@@ -854,7 +896,9 @@ def resume_missing(
     base_sha1) so files that yield no insertions are not retried forever.
 
     `workers` defaults to BOOK_TRANSLATE_RESUME_WORKERS (1 = serial). Each
-    file is still spliced onto disk before it is marked done.
+    file is still checkpointed into `out` on disk before it is marked done;
+    the book is extracted once into a long-lived working tree and rezipped
+    cleanly once at the end instead of being fully re-zipped per file.
     `--test` / `test_num` does not write resume-done (partial files stay retryable).
     """
     if short_names is None:
@@ -894,6 +938,7 @@ def resume_missing(
 
     order_dests = dest_spine_order(src, bilingual, todo)
     remaining = test_num
+    src_sha1 = _fingerprint(src) if write_state else None
 
     def _translate_one(
         base: str, src_html: str, log_fn: Callable[[str], None], max_blocks: int | None
@@ -912,73 +957,115 @@ def resume_missing(
             batch_tokens=batch_tokens,
         )
 
-    if workers <= 1:
-        current = bilingual
-        with zipfile.ZipFile(src) as zs:
-            for i, (base, src_path, dest) in enumerate(todo, 1):
-                if remaining is not None and remaining <= 0:
-                    break
-                if progress:
-                    progress(f"resume:{base} {i}/{len(todo)}")
-                src_html = decode_bytes(zs.read(src_path))
-                n_src = _en_block_count(src_html)
-                cap = remaining
-                new_html = _translate_one(base, src_html, log, cap)
-                # checkpoint first, then record state, so an interruption can
-                # never mark a file done whose translation is not in the output
-                splice(current, {dest: new_html}, out, order_dests=order_dests)
-                current = out
-                if remaining is not None:
-                    remaining -= n_src if cap is None else min(n_src, cap)
-                else:
-                    done.append(src_path)
-                    if write_state and state_path:
-                        _write_state(state_path, out, done, src)
-        return out, done
-
-    htmls: dict[str, str] = {}
-    with zipfile.ZipFile(src) as zs:
-        for _base, src_path, _dest in todo:
-            htmls[src_path] = decode_bytes(zs.read(src_path))
-    log_lock = threading.Lock()
-
-    def tlog(msg: str) -> None:
-        with log_lock:
-            log(msg)
-
-    splice_lock = threading.Lock()
-    current = [bilingual]
-    # Raise the gap only on this client's throttle for the parallel section;
-    # other clients in the process are unaffected.
-    throttle = client.throttle
-    prev_gap = throttle.min_interval
-    throttle.min_interval = max(prev_gap, _RESUME_CHAT_GAP_SEC)
-    errors: list[BaseException] = []
+    # One long-lived working tree for the whole run: extract the book once,
+    # write each finished file into it, and rezip once at the end. Per-file
+    # checkpoints append the changed members to a copy of the previous EPUB
+    # (_append_members) instead of re-deflating the whole book per file.
+    workdir = Path(tempfile.mkdtemp(prefix="file-resume-"))
+    committed = 0
+    current = bilingual
     try:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            futs = [
-                pool.submit(_translate_one, base, htmls[src_path], tlog, None)
-                for base, src_path, _dest in todo
-            ]
-            pending = {fut: item for fut, item in zip(futs, todo)}
-            for fut in as_completed(pending):
-                base, src_path, dest = pending[fut]
-                try:
-                    new_html = fut.result()
-                except BaseException as e:  # noqa: BLE001 - surface after other commits
-                    errors.append(e)
-                    tlog(f"resume {base} failed: {e}")
-                    continue
-                with splice_lock:
+        with zipfile.ZipFile(bilingual) as zin:
+            zin.extractall(workdir)
+        opfs = list(workdir.rglob("*.opf"))
+        opf_path = opfs[0] if opfs else None
+        opf_rel = str(opf_path.relative_to(workdir)).replace("\\", "/") if opf_path else ""
+
+        def _commit(dest: str, html: str) -> None:
+            """Write into the working tree, then checkpoint `out` on disk."""
+            nonlocal committed, current
+            target = workdir / dest
+            target.parent.mkdir(parents=True, exist_ok=True)
+            write_text_utf8(target, html)
+            entries = [(dest, target.read_bytes())]
+            if opf_path is not None:
+                write_text_utf8(
+                    opf_path,
+                    _patch_opf(
+                        read_text(opf_path),
+                        [dest],
+                        opf_zip_path=opf_rel,
+                        order_dests=order_dests,
+                    ),
+                )
+                entries.append((opf_rel, opf_path.read_bytes()))
+            _append_members(current, out, entries)
+            current = out
+            committed += 1
+
+        if workers <= 1:
+            with zipfile.ZipFile(src) as zs:
+                for i, (base, src_path, dest) in enumerate(todo, 1):
+                    if remaining is not None and remaining <= 0:
+                        break
+                    if progress:
+                        progress(f"resume:{base} {i}/{len(todo)}")
+                    src_html = decode_bytes(zs.read(src_path))
+                    n_src = _en_block_count(src_html)
+                    cap = remaining
+                    new_html = _translate_one(base, src_html, log, cap)
+                    # checkpoint first, then record state, so an interruption can
+                    # never mark a file done whose translation is not in the output
+                    _commit(dest, new_html)
+                    if remaining is not None:
+                        remaining -= n_src if cap is None else min(n_src, cap)
+                    else:
+                        done.append(src_path)
+                        if write_state and state_path:
+                            _write_state(state_path, out, done, src, src_sha1=src_sha1)
+            return out, done
+
+        htmls: dict[str, str] = {}
+        with zipfile.ZipFile(src) as zs:
+            for _base, src_path, _dest in todo:
+                htmls[src_path] = decode_bytes(zs.read(src_path))
+        log_lock = threading.Lock()
+
+        def tlog(msg: str) -> None:
+            with log_lock:
+                log(msg)
+
+        # Raise the gap only on this client's throttle for the parallel section;
+        # other clients in the process are unaffected.
+        throttle = client.throttle
+        prev_gap = throttle.min_interval
+        throttle.min_interval = max(prev_gap, _RESUME_CHAT_GAP_SEC)
+        errors: list[BaseException] = []
+        try:
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = [
+                    pool.submit(_translate_one, base, htmls[src_path], tlog, None)
+                    for base, src_path, _dest in todo
+                ]
+                pending = {fut: item for fut, item in zip(futs, todo)}
+                # workers only translate; this thread is the single consumer
+                # that commits results, so no splice lock is needed
+                for fut in as_completed(pending):
+                    base, src_path, dest = pending[fut]
+                    try:
+                        new_html = fut.result()
+                    except BaseException as e:  # noqa: BLE001 - surface after other commits
+                        errors.append(e)
+                        tlog(f"resume {base} failed: {e}")
+                        continue
                     if progress:
                         progress(f"resume:{base} {len(done) + 1}/{len(todo)}")
-                    splice(current[0], {dest: new_html}, out, order_dests=order_dests)
-                    current[0] = out
+                    _commit(dest, new_html)
                     done.append(src_path)
                     if write_state and state_path:
-                        _write_state(state_path, out, done, src)
+                        _write_state(state_path, out, done, src, src_sha1=src_sha1)
+        finally:
+            throttle.min_interval = prev_gap
+        if errors:
+            raise errors[0]
+        return out, done
     finally:
-        throttle.min_interval = prev_gap
-    if errors:
-        raise errors[0]
-    return out, done
+        try:
+            if committed:
+                # one clean rezip: the deliverable keeps mimetype first/stored
+                # and has none of the checkpoint's shadowed duplicate members
+                rezip(workdir, out)
+                if write_state and state_path and done:
+                    _write_state(state_path, out, done, src, src_sha1=src_sha1)
+        finally:
+            shutil.rmtree(workdir, ignore_errors=True)
