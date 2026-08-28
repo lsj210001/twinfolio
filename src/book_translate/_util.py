@@ -54,14 +54,31 @@ def has_zh_follow(el) -> bool:
     return cn >= 2 and cn >= en
 
 
-_NUMBERED_LINE_RE = re.compile(r"^\s*(\d+)\s*[.、)）．]\s*(.+)$")
+# Index is capped at 3 digits so prose starting with a year ("2023. ...")
+# can never look like an item marker. A bare ":" needs trailing whitespace
+# so ratios like "1:2" stay content; the full-width "：" never appears there.
+_NUMBERED_LINE_RE = re.compile(
+    r"^\s*"
+    r"(?:[-*+•]\s+)?"  # optional list bullet: "- 1. ..."
+    r"(\*{1,2}|__)?"  # optional markdown emphasis opener: "**1.**"
+    r"(?:第\s*)?(\d{1,3})(?:\s*段)?"  # index, plain or "第1段"
+    r"\s*(?:[.、)）．：]|:(?=\s|$))"
+    r"(?:\1)?"  # closing emphasis only if one was opened
+    r"\s*(.*)$"
+)
 
 
-def parse_numbered_lines(raw: str) -> dict[int, str]:
-    """Parse `1. text` numbered lists, accepting "1、" / "1)" / "1．" variants.
+def parse_numbered_lines(raw: str, expect: int | None = None) -> dict[int, str]:
+    """Parse `1. text` numbered lists, accepting "1、" / "1)" / "1．" / "1:" /
+    "**1.**" / "- 1." / "第1段：" variants.
 
     Un-numbered lines are joined onto the previous item (multi-line answers),
     so long translations are not silently truncated to their first line.
+
+    A numbered line only *starts* an item when its index is greater than the
+    last accepted one and, when `expect` is given, no larger than `expect`.
+    Anything else (a numbered sub-list inside one translation, restarts) is
+    joined onto the current item as content instead of swallowing it.
     """
     found: dict[int, list[str]] = {}
     last_idx: int | None = None
@@ -70,9 +87,14 @@ def parse_numbered_lines(raw: str) -> dict[int, str]:
         if not line:
             continue
         m = _NUMBERED_LINE_RE.match(line)
-        if m:
-            last_idx = int(m.group(1))
-            found[last_idx] = [m.group(2).strip()]
+        idx = int(m.group(2)) if m else None
+        if (
+            idx is not None
+            and (last_idx is None or idx > last_idx)
+            and (expect is None or idx <= expect)
+        ):
+            last_idx = idx
+            found[idx] = [m.group(3).strip()]  # type: ignore[union-attr]
         elif last_idx is not None:
             found[last_idx].append(line)
     return {i: " ".join(parts).strip().strip("\"“”") for i, parts in found.items()}
