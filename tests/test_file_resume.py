@@ -406,6 +406,62 @@ def test_patch_opf_keeps_full_path_for_same_basename():
     assert file_resume.spine_hrefs(out) == ["Text/ch1.xhtml", "Notes/ch1.xhtml"]
 
 
+def test_splice_patches_container_declared_opf_not_decoy(tmp_path):
+    """A leftover .opf that sorts (and often rglobs) first must not receive the
+    manifest/spine entries; container.xml names the real package document."""
+    container = """<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="real/package.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>
+"""
+    real_opf = """<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Real Book</dc:title>
+    <dc:identifier id="id">urn:real</dc:identifier>
+  </metadata>
+  <manifest>
+    <item href="Text/alpha.xhtml" id="alpha" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine>
+    <itemref idref="alpha"/>
+  </spine>
+</package>
+"""
+    decoy_opf = """<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Decoy</dc:title></metadata>
+  <manifest><item href="a-decoy.ncx" id="ncx" media-type="application/x-dtbncx+xml"/></manifest>
+  <spine toc="ncx"/>
+</package>
+"""
+    bi = tmp_path / "bi.epub"
+    with zipfile.ZipFile(bi, "w") as z:
+        z.writestr("mimetype", "application/epub+zip", zipfile.ZIP_STORED)
+        z.writestr("META-INF/container.xml", container)
+        z.writestr("a-decoy.opf", decoy_opf)
+        z.writestr("a-decoy.ncx", "<ncx/>")
+        z.writestr("real/package.opf", real_opf)
+        z.writestr("real/Text/alpha.xhtml", _zh_pair(ALPHA_TEXT))
+
+    out = tmp_path / "out.epub"
+    new_html = "<html><body><p>brand new chapter</p></body></html>"
+    file_resume.splice(
+        bi,
+        {"real/Text/new.xhtml": new_html},
+        out,
+        order_dests=["real/Text/alpha.xhtml", "real/Text/new.xhtml"],
+    )
+
+    real = _read(out, "real/package.opf")
+    assert 'href="Text/new.xhtml"' in real, "new chapter must join the real manifest"
+    assert file_resume.spine_hrefs(real) == ["Text/alpha.xhtml", "Text/new.xhtml"]
+    assert _read(out, "a-decoy.opf") == decoy_opf, "decoy OPF must stay untouched"
+    assert _read(out, "real/Text/new.xhtml") == new_html
+
+
 def test_resume_inserts_missing_chapter_in_source_spine_order(tmp_path):
     ncx = (
         '<?xml version="1.0"?><ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">'
