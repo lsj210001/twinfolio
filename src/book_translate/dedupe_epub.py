@@ -192,7 +192,11 @@ def rewrite(src: Path, dest: Path, log: Callable[[str], None] = print) -> int:
                 continue
             html = read_text(f)
             rel = f.relative_to(tmp).as_posix()
-            new, n = collapse(html, log=lambda msg, _rel=rel: log(f"dedupe {_rel}: {msg}"))
+
+            def _dlog(msg: str, _rel: str = rel) -> None:
+                log(f"dedupe {_rel}: {msg}")
+
+            new, n = collapse(html, log=_dlog)
             if n:
                 write_text_utf8(f, new)
                 total += n

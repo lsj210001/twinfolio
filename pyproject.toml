@@ -80,10 +80,14 @@ ignore = [
   "SIM108",  # if-else-block-instead-of-if-exp (1)
   "SIM109",  # compare-with-tuple (1)
   "SIM115",  # open-file-with-context-handler (1)
+  "UP012",   # unnecessary-encode-utf8 (5)
   "UP017",   # datetime-timezone-utc (2)
+  "UP033",   # lru-cache-with-maxsize-none (2)
   "UP035",   # deprecated-import (3)
   "UP037",   # quoted-annotation (1)
   "UP045",   # non-pep604-annotation-optional (4)
+  "RUF059",  # unused-unpacked-variable (1)
+  "SIM117",  # multiple-with-statements (2)
 ]
 
 [tool.mypy]

@@ -43,7 +43,7 @@ def container_opf_path(container_xml: str) -> str | None:
     rootfiles = [el for el in soup.find_all(True) if _local(el.name) == "rootfile"]
     declared = [el for el in rootfiles if (el.get("media-type") or "") == OPF_MEDIA_TYPE]
     for el in declared + rootfiles:
-        path = (el.get("full-path") or "").strip().replace("\\", "/")
+        path = str(el.get("full-path") or "").strip().replace("\\", "/")
         if path:
             return posixpath.normpath(path).lstrip("/")
     return None
@@ -105,7 +105,7 @@ def ncx_href_from_opf(opf_text: str) -> str | None:
     for el in soup.find_all(True):
         if _local(el.name) != "item":
             continue
-        href = (el.get("href") or "").split("#", 1)[0].strip()
+        href = str(el.get("href") or "").split("#", 1)[0].strip()
         if not href:
             continue
         ident = el.get("id")
