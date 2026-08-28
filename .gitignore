@@ -10,3 +10,6 @@ dist/
 *.egg-info/
 .DS_Store
 .pytest_cache/
+.coverage
+.mypy_cache/
+.ruff_cache/

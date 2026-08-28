@@ -33,6 +33,25 @@ twinfolio "/path/to/book.epub" -o ./out --retranslate ch03.html
 twinfolio "/path/to/book.epub" -o ./out --use-context --context-paragraphs 8
 ```
 
+## CLI 参考
+
+`twinfolio EPUB [选项]`（`book-translate` 是同一命令的别名）：
+
+| 选项 | 作用 |
+| --- | --- |
+| `EPUB` | 源 `.epub` 路径（必填） |
+| `-o, --out-dir DIR` | 输出目录，默认当前目录 |
+| `--bilingual-only` | 只出双语版，跳过纯中文拆分 |
+| `--debug` | 出错时打印完整 traceback（默认只打印错误链） |
+| `--test` | 只翻正文前 N 段（默认 10），跳过标题补译和纯中文拆分，写出 `试译.epub` |
+| `--test-num N` | 配合 `--test` 指定段数；单独给出时隐含 `--test`，须 `>= 1` |
+| `--only a.html,b.html` | 只翻这些 HTML（文件名或 zip 内路径，逗号分隔） |
+| `--retranslate a.html` | 强制重翻这些 HTML，即使已翻过 |
+| `--use-context` | 把最近 N 段译文作为只读上下文随批发送 |
+| `--context-paragraphs N` | 滚动上下文段数，默认 8（须配合 `--use-context`） |
+
+退出码：`0` 成功，`1` 翻译失败，`2` 参数错误。
+
 输出：
 
 - `book-中英双语.epub`
@@ -52,10 +71,10 @@ twinfolio "/path/to/book.epub" -o ./out --use-context --context-paragraphs 8
 
 | 环境变量 | 作用 |
 | --- | --- |
-| `OPENAI_API_KEY` | 必填 |
+| `OPENAI_API_KEY` | 必填；也认旧名 `BBM_OPENAI_API_KEY`（正名优先） |
 | `OPENAI_BASE_URL` | OpenAI 兼容接口，默认 `https://api.openai.com/v1` |
-| `BOOK_TRANSLATE_MODEL` | 模型名，默认 `gpt-4o-mini` |
-| `BOOK_TRANSLATE_REASONING_EFFORT` | 推理强度 |
+| `BOOK_TRANSLATE_MODEL` | 模型名，默认 `gpt-4o-mini`；也认旧名 `MODEL`（正名优先） |
+| `BOOK_TRANSLATE_REASONING_EFFORT` | 推理强度，默认 `low`；也认旧名 `BBM_REASONING_EFFORT`（正名优先） |
 | `BOOK_TRANSLATE_RESUME_WORKERS` | 按文件翻译线程数，默认 `1`，最大 `4` |
 | `SHORT_BATCH_SIZE` | 短文件每批最多段数，默认 `8` |
 | `BOOK_TRANSLATE_BATCH_TOKENS` | 按估算 token 攒批，默认 `1600`，短文件 `600` |
@@ -84,6 +103,23 @@ twinfolio "/path/to/book.epub" -o ./out --use-context --context-paragraphs 8
 5. 修复目录（NCX + EPUB3 `nav.xhtml`）
 
 结束时打印本进程 LLM token 汇总。
+
+## 故障排查
+
+**HTTP 401 / 403（立即失败，不重试）**
+密钥无效或没有该模型的权限。检查 `OPENAI_API_KEY`（或旧名 `BBM_OPENAI_API_KEY`）和 `OPENAI_BASE_URL` 是否匹配同一家服务商。非 429 的 4xx 都会立刻报错，不会烧重试次数。
+
+**HTTP 429 / 5xx（自动重试）**
+限流和服务端错误会按指数退避加抖动自动重试（默认 3 次），`Retry-After` 响应头会拉长等待。3 次仍失败时报 `chat failed after 3 attempts`。缓解：调低 `BOOK_TRANSLATE_RESUME_WORKERS`，稍后重跑——已翻内容都在缓存和断点里，不会重复付费。
+
+**换模型后缓存全部失效**
+`llm-cache.jsonl` 的键是 `sha1(model + prompt + 归一化原文)`，改 `BOOK_TRANSLATE_MODEL`（或提示词）后旧条目全部 miss、重新翻，属预期行为。旧条目留着无害；想瘦身可直接删掉该文件。
+
+**改过源 EPUB 后断点失效**
+`resume-done.json` 同时记录断点 EPUB 的 `base_sha1` 和源 EPUB 的 `src_sha1`。重新下载或编辑过源文件后 sha1 变化，断点作废、整本重翻，属预期行为。`--test` 试翻不写断点，部分翻译的文件保持可重试。
+
+**输出里出现漏翻 / 想强制重翻某章**
+用 `--retranslate ch03.html` 强制重做；只想补漏用 `--only`。整本重来就删 `-o` 下的 `.work-{书名}/` 目录。
 
 ## License
 
