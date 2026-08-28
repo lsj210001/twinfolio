@@ -203,11 +203,19 @@ def _usage_int(*values: object) -> int:
 
 
 class LlmCache:
-    """jsonl cache. Empty or half-written lines are ignored.
+    """Append-only jsonl cache. Empty or half-written lines are ignored.
 
-    Writes replace the whole file via a temp path so a crash cannot leave a
-    torn jsonl. A sibling `.lock` file serializes writers.
+    put() appends exactly one line, so writing a whole book costs O(n) disk
+    bytes instead of the O(n^2) a rewrite-everything scheme costs. Rewriting
+    a key appends a superseding line; the loader keeps the last occurrence.
+    Dead lines are squeezed out by compact() -- called automatically from
+    _load() once they exceed `_compact_slack`, or explicitly by a pipeline
+    when a run finishes. A sibling `.lock` file serializes writers.
     """
+
+    # Auto-compact on load once the file carries this many superseded or
+    # unparseable lines beyond the unique keys.
+    _compact_slack = 1024
 
     def __init__(self, path: Path):
         self.path = Path(path)
@@ -223,33 +231,45 @@ class LlmCache:
         blob = f"{model}\n{prompt}\n{norm(source)}"
         return hashlib.sha1(blob.encode("utf-8")).hexdigest()
 
-    def _load(self) -> None:
+    def _read_disk(self) -> tuple[dict[str, str], int]:
+        """Read the file line by line, last occurrence of a key winning.
+
+        Returns the entries plus the count of non-blank lines; the excess of
+        that count over the unique keys is the dead weight compact() removes.
+        Streaming keeps peak memory at one line instead of the whole file,
+        and errors="replace" confines a torn multibyte character to its own
+        line instead of discarding every entry after it.
+        """
+        entries: dict[str, str] = {}
+        lines = 0
         if not self.path.is_file():
-            return
+            return entries, lines
         try:
-            if self.path.stat().st_size == 0:
-                return
+            with open(self.path, encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    lines += 1
+                    try:
+                        obj = json.loads(line)
+                    except json.JSONDecodeError:
+                        continue
+                    if not isinstance(obj, dict):
+                        continue
+                    key, response = obj.get("key"), obj.get("response")
+                    if isinstance(key, str) and isinstance(response, str) and key and response:
+                        entries[key] = response
         except OSError:
-            return
-        try:
-            raw = self.path.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
-            return
-        if not raw.strip():
-            return
-        for line in raw.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if not isinstance(obj, dict):
-                continue
-            key, response = obj.get("key"), obj.get("response")
-            if isinstance(key, str) and isinstance(response, str) and key and response:
-                self._mem[key] = response
+            return entries, lines
+        return entries, lines
+
+    def _load(self) -> None:
+        entries, lines = self._read_disk()
+        with self._mem_lock:
+            self._mem.update(entries)
+        if lines - len(entries) > self._compact_slack:
+            self.compact()
 
     def get(self, model: str, prompt: str, source: str = "") -> str | None:
         key = self.make_key(model, prompt, source)
@@ -260,18 +280,48 @@ class LlmCache:
         if not response:
             return
         key = self.make_key(model, prompt, source)
+        # Memory first, and never while holding the file lock below, so the
+        # two locks are never nested here and in-process readers see the
+        # entry even if the disk append stalls.
         with self._mem_lock:
             self._mem[key] = response
+        data = (
+            json.dumps({"key": key, "response": response}, ensure_ascii=False) + "\n"
+        ).encode("utf-8")
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with _exclusive_lock(self.path.with_name(self.path.name + ".lock")):
+            # Open per put rather than caching an append handle: compact()
+            # swaps the inode via os.replace, and a held handle would keep
+            # appending to the orphaned old file.
+            with open(self.path, "a+b") as fh:
+                fh.seek(0, os.SEEK_END)
+                size = fh.tell()
+                if size > 0:
+                    fh.seek(size - 1)
+                    if fh.read(1) != b"\n":
+                        # A crash mid-append leaves a torn last line; gluing
+                        # this record onto it would make the loader drop
+                        # both. Terminate the torn line first, atomically
+                        # under the same file lock.
+                        data = b"\n" + data
+                fh.write(data)
+
+    def compact(self) -> None:
+        """Rewrite the file with one line per key, dropping dead lines.
+
+        The rewrite merges what is on disk (other processes' appends
+        included) with this instance's memory, then replaces the file via a
+        temp path under the writer lock so a crash cannot leave a torn file.
+        """
         self.path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.path.with_name(self.path.name + ".tmp")
         with _exclusive_lock(self.path.with_name(self.path.name + ".lock")):
-            disk = LlmCache(self.path) if self.path.is_file() else None
-            # Merge and snapshot under the thread lock so no other thread can
-            # resize _mem mid-iteration; serialize the snapshot outside it.
+            disk, _ = self._read_disk()
+            # Merge and snapshot under the thread lock so no other thread
+            # can resize _mem mid-iteration; serialize outside it.
             with self._mem_lock:
-                if disk is not None:
-                    disk._mem.update(self._mem)
-                    self._mem = disk._mem
+                disk.update(self._mem)
+                self._mem = disk
                 snapshot = dict(self._mem)
             payload = "".join(
                 json.dumps({"key": k, "response": v}, ensure_ascii=False) + "\n"
