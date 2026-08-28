@@ -705,3 +705,90 @@ def test_resume_test_num_does_not_write_done(tmp_path):
     assert not state.exists()
     assert "中文（The quick" in _read(out, "EPUB/Text/alpha.xhtml")
     assert "中文（Neural" not in _read(out, "EPUB/Text/beta.xhtml")
+
+
+def _make_many_src(tmp_path: Path, n: int) -> Path:
+    ids = [f"ch{i:03d}" for i in range(n)]
+    src = tmp_path / "many.epub"
+    with zipfile.ZipFile(src, "w") as z:
+        z.writestr("mimetype", "application/epub+zip", zipfile.ZIP_STORED)
+        z.writestr("EPUB/content.opf", _opf_spine(*ids))
+        for i, ident in enumerate(ids):
+            z.writestr(
+                f"EPUB/Text/{ident}.xhtml",
+                f"<html><body><p>Chapter number {i} explains the topic in detail.</p></body></html>",
+            )
+    return src
+
+
+def test_resume_many_files_final_epub_is_clean(tmp_path):
+    """The deliverable after many per-file checkpoints must be a clean zip:
+    no duplicate members, mimetype first and stored, contents readable."""
+    n = 12
+    src = _make_many_src(tmp_path, n)
+    base = tmp_path / "base.epub"
+    shutil.copy2(src, base)
+    out = tmp_path / "out.epub"
+    state = tmp_path / "resume-done.json"
+    file_resume.resume_missing(
+        src, base, out, client=StubClient(_echo_chat), log=lambda m: None, state_path=state, workers=1
+    )
+    with zipfile.ZipFile(out) as z:
+        assert z.testzip() is None
+        names = z.namelist()
+        assert names[0] == "mimetype"
+        assert z.getinfo("mimetype").compress_type == zipfile.ZIP_STORED
+        assert len(names) == len(set(names)), "final EPUB must not contain duplicate members"
+    assert "中文（Chapter number 0" in _read(out, "EPUB/Text/ch000.xhtml")
+    assert f"中文（Chapter number {n - 1}" in _read(out, f"EPUB/Text/ch{n - 1:03d}.xhtml")
+    assert file_resume.spine_hrefs(_read(out, "EPUB/content.opf")) == [
+        f"Text/ch{i:03d}.xhtml" for i in range(n)
+    ]
+
+
+def test_resume_full_unzip_rezip_runs_once_not_per_file(tmp_path, monkeypatch):
+    """Full-book extract and rezip must be O(1) per run, not O(files):
+    that per-file extractall+rezip is what made resume O(files^2)."""
+    n = 8
+    src = _make_many_src(tmp_path, n)
+    base = tmp_path / "base.epub"
+    shutil.copy2(src, base)
+    out = tmp_path / "out.epub"
+    counts = {"rezip": 0, "extractall": 0}
+    real_rezip = file_resume.rezip
+    real_extractall = zipfile.ZipFile.extractall
+
+    def counting_rezip(src_dir, target):
+        counts["rezip"] += 1
+        return real_rezip(src_dir, target)
+
+    def counting_extractall(self, *args, **kwargs):
+        counts["extractall"] += 1
+        return real_extractall(self, *args, **kwargs)
+
+    monkeypatch.setattr(file_resume, "rezip", counting_rezip)
+    monkeypatch.setattr(zipfile.ZipFile, "extractall", counting_extractall)
+    file_resume.resume_missing(
+        src, base, out, client=StubClient(_echo_chat), log=lambda m: None, workers=1
+    )
+    assert counts["rezip"] == 1
+    assert counts["extractall"] == 1
+    assert "中文（Chapter number 3" in _read(out, "EPUB/Text/ch003.xhtml")
+
+
+def test_append_members_checkpoint_is_valid_and_latest_wins(tmp_path):
+    """The per-file checkpoint primitive: appended members shadow earlier
+    duplicates, the zip stays valid, and mimetype stays the first member."""
+    prev = tmp_path / "prev.epub"
+    with zipfile.ZipFile(prev, "w") as z:
+        z.writestr("mimetype", "application/epub+zip", zipfile.ZIP_STORED)
+        z.writestr("EPUB/Text/a.xhtml", "<html><body><p>old</p></body></html>")
+    out = tmp_path / "ckpt.epub"
+    file_resume._append_members(prev, out, [("EPUB/Text/a.xhtml", b"<html><body><p>new v1</p></body></html>")])
+    file_resume._append_members(out, out, [("EPUB/Text/a.xhtml", b"<html><body><p>new v2</p></body></html>")])
+    with zipfile.ZipFile(out) as z:
+        assert z.testzip() is None
+        assert z.namelist()[0] == "mimetype"
+        assert z.read("EPUB/Text/a.xhtml") == b"<html><body><p>new v2</p></body></html>"
+    with zipfile.ZipFile(prev) as z:
+        assert z.read("EPUB/Text/a.xhtml") == b"<html><body><p>old</p></body></html>"
