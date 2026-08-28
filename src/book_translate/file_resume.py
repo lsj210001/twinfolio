@@ -29,6 +29,7 @@ from ._util import (
     rezip,
     write_text_utf8,
 )
+from .epub_io import find_opf_in_tree, find_opf_in_zip
 from .glossary import Term, apply_glossary, restore_text, visible_text
 from .llm import LlmClient
 
@@ -200,20 +201,6 @@ def _xml_attr(value: str) -> str:
     return value.replace("&", "&amp;").replace('"', "&quot;").replace("<", "&lt;")
 
 
-def _find_opf_zip_path(z: zipfile.ZipFile) -> str | None:
-    names = z.namelist()
-    container = "META-INF/container.xml"
-    if container in names:
-        raw = decode_bytes(z.read(container))
-        m = re.search(r'full-path\s*=\s*["\']([^"\']+)["\']', raw, re.I)
-        if m:
-            path = m.group(1).replace("\\", "/")
-            if path in names:
-                return path
-    opfs = [n for n in names if n.lower().endswith(".opf")]
-    return opfs[0] if opfs else None
-
-
 def _find_local(root, local: str):
     for el in root.find_all(True):
         if _local(el.name) == local:
@@ -275,7 +262,7 @@ def manifest_hrefs(opf_text: str) -> list[str]:
 def spine_zip_paths(epub: Path) -> list[str]:
     """Document zip paths in OPF spine order (full paths, not basenames)."""
     with zipfile.ZipFile(epub) as z:
-        opf = _find_opf_zip_path(z)
+        opf = find_opf_in_zip(z)
         if not opf:
             return []
         soup = BeautifulSoup(decode_bytes(z.read(opf)), "lxml-xml")
@@ -782,10 +769,9 @@ def splice(
             dest = tmp / rel
             dest.parent.mkdir(parents=True, exist_ok=True)
             write_text_utf8(dest, html)
-        opfs = list(tmp.rglob("*.opf"))
-        if opfs:
-            opf = opfs[0]
-            opf_rel = str(opf.relative_to(tmp)).replace("\\", "/")
+        opf = find_opf_in_tree(tmp)
+        if opf is not None:
+            opf_rel = opf.relative_to(tmp).as_posix()
             write_text_utf8(
                 opf,
                 _patch_opf(

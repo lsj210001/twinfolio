@@ -15,6 +15,7 @@ from pathlib import Path
 from bs4 import BeautifulSoup, Tag
 
 from ._util import rezip
+from .epub_io import find_ncx_in_tree, find_opf_in_tree
 
 
 def _local(name: str | None) -> str:
@@ -34,11 +35,6 @@ def _children(el: Tag, local: str) -> list[Tag]:
 def _first(el: Tag, local: str) -> Tag | None:
     kids = _children(el, local)
     return kids[0] if kids else None
-
-
-def _find_one(root: Path, suffix: str) -> Path | None:
-    hits = sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() == suffix)
-    return hits[0] if hits else None
 
 
 def _dc_text(opf_soup: BeautifulSoup, local: str) -> str:
@@ -226,8 +222,8 @@ def _patch_opf(opf_path: Path, nav_href: str) -> None:
 
 def repair_extracted(root: Path) -> dict[str, int]:
     """Repair TOC files already extracted from an EPUB. Returns counts."""
-    ncx_path = _find_one(root, ".ncx")
-    opf_path = _find_one(root, ".opf")
+    opf_path = find_opf_in_tree(root)
+    ncx_path = find_ncx_in_tree(root, opf_path)
     title = ""
     author = ""
     if opf_path is not None:

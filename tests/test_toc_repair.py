@@ -97,3 +97,69 @@ def test_repair_epub_adds_nav(tmp_path: Path):
     assert 'playOrder="1"' in ncx
     assert 'properties="nav"' in opf
     assert "第1章 伊利亚看到了什么？" in nav
+
+
+def test_repair_targets_container_declared_opf_and_ncx(tmp_path: Path):
+    """Decoy .opf/.ncx sort first; repair must follow container.xml to the real
+    package and its declared NCX, and write nav next to the real NCX."""
+    container = """<?xml version="1.0"?>
+<container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+  <rootfiles>
+    <rootfile full-path="real/package.opf" media-type="application/oebps-package+xml"/>
+  </rootfiles>
+</container>
+"""
+    real_opf = """<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="id" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+    <dc:title>Real Book</dc:title>
+    <dc:creator>Real Author</dc:creator>
+    <dc:identifier id="id">urn:real</dc:identifier>
+  </metadata>
+  <manifest>
+    <item href="toc.ncx" id="ncx" media-type="application/x-dtbncx+xml"/>
+    <item href="Text/chapter-1.xhtml" id="c1" media-type="application/xhtml+xml"/>
+  </manifest>
+  <spine toc="ncx">
+    <itemref idref="c1"/>
+  </spine>
+</package>
+"""
+    decoy_opf = """<?xml version="1.0"?>
+<package xmlns="http://www.idpf.org/2007/opf" version="3.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"><dc:title>Decoy Book</dc:title></metadata>
+  <manifest><item href="a-decoy.ncx" id="ncx" media-type="application/x-dtbncx+xml"/></manifest>
+  <spine toc="ncx"/>
+</package>
+"""
+    decoy_ncx = """<?xml version="1.0"?>
+<ncx xmlns="http://www.daisy.org/z3986/2005/ncx/" version="2005-1">
+<navMap><navPoint id="d1"><navLabel>Decoy chapter</navLabel>
+<content src="nowhere.xhtml"/></navPoint></navMap>
+</ncx>
+"""
+    src = tmp_path / "book.epub"
+    with zipfile.ZipFile(src, "w") as z:
+        z.writestr("mimetype", "application/epub+zip", compress_type=zipfile.ZIP_STORED)
+        z.writestr("META-INF/container.xml", container)
+        z.writestr("a-decoy.opf", decoy_opf)
+        z.writestr("a-decoy.ncx", decoy_ncx)
+        z.writestr("real/package.opf", real_opf)
+        z.writestr("real/toc.ncx", BROKEN_NCX)
+        z.writestr("real/Text/chapter-1.xhtml", "<html><body><p>hi</p></body></html>")
+
+    out = repair_epub_toc(src)
+    with zipfile.ZipFile(out) as z:
+        names = z.namelist()
+        real_ncx = z.read("real/toc.ncx").decode("utf-8")
+        real_opf_out = z.read("real/package.opf").decode("utf-8")
+        decoy_opf_out = z.read("a-decoy.opf").decode("utf-8")
+        decoy_ncx_out = z.read("a-decoy.ncx").decode("utf-8")
+
+    assert "real/nav.xhtml" in names, "nav must live next to the real NCX"
+    assert "a-decoy.opf".replace(".opf", "-nav.xhtml") not in names
+    assert "<text>第1章 伊利亚看到了什么？</text>" in real_ncx
+    assert "<text>Real Book</text>" in real_ncx, "docTitle comes from the real OPF"
+    assert 'properties="nav"' in real_opf_out
+    assert decoy_opf_out == decoy_opf, "decoy OPF must stay untouched"
+    assert decoy_ncx_out == decoy_ncx, "decoy NCX must stay untouched"
