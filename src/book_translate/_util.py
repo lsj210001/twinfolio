@@ -75,29 +75,104 @@ def parse_numbered_lines(raw: str) -> dict[int, str]:
 
 _XML_ENC_BYTES_RE = re.compile(rb'<\?xml[^>]*?encoding=["\']([A-Za-z0-9_.\-]+)["\']', re.I)
 _XML_ENC_TEXT_RE = re.compile(r'^(\s*<\?xml[^>]*?encoding=["\'])([^"\']+)(["\'])', re.I)
+# matches both <meta charset="..."> and
+# <meta http-equiv="Content-Type" content="text/html; charset=...">
+_META_CHARSET_BYTES_RE = re.compile(rb'<meta\b[^>]*?charset\s*=\s*["\']?\s*([A-Za-z0-9_.\-]+)', re.I)
+_META_CHARSET_TEXT_RE = re.compile(r'(<meta\b[^>]*?charset\s*=\s*["\']?\s*)([A-Za-z0-9_.\-]+)', re.I)
+
+# Legacy books routinely declare a subset of the encoding actually used;
+# decode with the superset so those extra characters survive.
+_ENCODING_ALIASES = {
+    "gb2312": "gbk",
+    "gb-2312": "gbk",
+    "iso-8859-1": "cp1252",
+    "iso8859-1": "cp1252",
+    "latin-1": "cp1252",
+    "latin1": "cp1252",
+    "windows-1252": "cp1252",
+    "us-ascii": "ascii",
+    "ucs-2": "utf-16",
+    "ucs2": "utf-16",
+}
+
+# Single-byte codecs that decode almost any byte sequence without error, so a
+# mislabelled UTF-8 file would silently turn into mojibake. For these we try
+# strict UTF-8 first and only fall back to the declared codec when that fails.
+_LATIN_LIKE = {"cp1252", "ascii"}
 
 
-def decode_bytes(raw: bytes) -> str:
-    """Decode HTML/XML bytes: BOM first, then the XML declaration, then UTF-8.
+def _declared_encoding(raw: bytes) -> str | None:
+    """Sniff the declared encoding: XML declaration first, then HTML meta."""
+    m = _XML_ENC_BYTES_RE.search(raw[:1024])
+    if m is None:
+        m = _META_CHARSET_BYTES_RE.search(raw[:2048])
+    if m is None:
+        return None
+    name = m.group(1).decode("ascii", errors="replace").strip().lower()
+    return _ENCODING_ALIASES.get(name, name)
 
-    Never raises; the last resort is utf-8 with errors="replace" so damage
-    stays visible instead of being silently dropped.
-    """
+
+def _decode_utf16_no_bom(raw: bytes) -> str | None:
+    """Pick utf-16-le/be for BOM-less data by which half holds the NUL bytes."""
+    sample = raw[:2048]
+    even_nuls = sample[0::2].count(0)
+    odd_nuls = sample[1::2].count(0)
+    if odd_nuls > even_nuls * 2:
+        return raw.decode("utf-16-le", errors="replace")
+    if even_nuls > odd_nuls * 2:
+        return raw.decode("utf-16-be", errors="replace")
+    return None
+
+
+def _decode_bytes_impl(raw: bytes) -> str:
     if raw.startswith(codecs.BOM_UTF8):
         return raw.decode("utf-8-sig", errors="replace")
     if raw.startswith(codecs.BOM_UTF16_LE) or raw.startswith(codecs.BOM_UTF16_BE):
         return raw.decode("utf-16", errors="replace")
-    m = _XML_ENC_BYTES_RE.search(raw[:512])
-    if m:
-        enc = m.group(1).decode("ascii", errors="replace")
-        try:
-            return raw.decode(enc)
-        except (LookupError, UnicodeDecodeError, ValueError):
-            pass
+    # BOM-less UTF-16 markup: '<' interleaved with a NUL byte
+    if raw.startswith(b"<\x00"):
+        return raw.decode("utf-16-le", errors="replace")
+    if raw.startswith(b"\x00<"):
+        return raw.decode("utf-16-be", errors="replace")
+    enc = _declared_encoding(raw)
+    if enc:
+        if enc == "utf-16":
+            text = _decode_utf16_no_bom(raw)
+            if text is not None:
+                return text
+        else:
+            if enc in _LATIN_LIKE:
+                try:
+                    return raw.decode("utf-8")
+                except UnicodeDecodeError:
+                    pass
+            try:
+                return raw.decode(enc)
+            except (LookupError, UnicodeDecodeError, ValueError):
+                pass
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError:
         return raw.decode("utf-8", errors="replace")
+
+
+def decode_bytes(raw: bytes, log: Callable[[str], None] = print) -> str:
+    """Decode HTML/XML bytes: BOM, then the declared encoding (XML declaration
+    or HTML meta charset), then UTF-8.
+
+    Never raises; the last resort is utf-8 with errors="replace" so damage
+    stays visible instead of being silently dropped. An unusual share of
+    U+FFFD/NUL in the result triggers a warning.
+    """
+    text = _decode_bytes_impl(raw)
+    if text:
+        bad = text.count("\ufffd") + text.count("\x00")
+        if bad / len(text) > 0.01:
+            log(
+                f"warning: decoded text has {bad}/{len(text)} replacement/NUL "
+                "characters; the source encoding is likely misdeclared"
+            )
+    return text
 
 
 def read_text(path: Path) -> str:
@@ -105,11 +180,18 @@ def read_text(path: Path) -> str:
 
 
 def ensure_utf8_declaration(text: str) -> str:
-    """Rewrite a non-UTF-8 XML declaration since we always write UTF-8 back."""
+    """Rewrite non-UTF-8 XML/meta charset declarations since we always write
+    UTF-8 back."""
     m = _XML_ENC_TEXT_RE.match(text)
     if m and m.group(2).lower() not in {"utf-8", "utf8"}:
         text = text[: m.start(2)] + "utf-8" + text[m.end(2) :]
-    return text
+
+    def _meta_sub(mm: re.Match[str]) -> str:
+        if mm.group(2).lower() in {"utf-8", "utf8"}:
+            return mm.group(0)
+        return mm.group(1) + "utf-8"
+
+    return _META_CHARSET_TEXT_RE.sub(_meta_sub, text)
 
 
 def write_text_utf8(path: Path, text: str) -> None:

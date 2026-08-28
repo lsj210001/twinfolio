@@ -14,7 +14,7 @@ from pathlib import Path
 
 from bs4 import BeautifulSoup, Tag
 
-from ._util import rezip
+from ._util import read_text, rezip
 
 
 def _local(name: str | None) -> str:
@@ -194,7 +194,7 @@ def ncx_to_nav_xhtml(ncx_raw: str, *, title: str = "目录") -> str:
 
 
 def _patch_opf(opf_path: Path, nav_href: str) -> None:
-    soup = BeautifulSoup(opf_path.read_text(encoding="utf-8", errors="ignore"), "lxml-xml")
+    soup = BeautifulSoup(read_text(opf_path), "lxml-xml")
     manifest = soup.find("manifest")
     if manifest is None:
         return
@@ -231,7 +231,7 @@ def repair_extracted(root: Path) -> dict[str, int]:
     title = ""
     author = ""
     if opf_path is not None:
-        opf_soup = BeautifulSoup(opf_path.read_text(encoding="utf-8", errors="ignore"), "lxml-xml")
+        opf_soup = BeautifulSoup(read_text(opf_path), "lxml-xml")
         title = _dc_text(opf_soup, "title")
         author = _dc_text(opf_soup, "creator")
 
@@ -240,7 +240,7 @@ def repair_extracted(root: Path) -> dict[str, int]:
         return stats
 
     repaired = repair_ncx_xml(
-        ncx_path.read_text(encoding="utf-8", errors="ignore"),
+        read_text(ncx_path),
         title=title,
         author=author,
     )

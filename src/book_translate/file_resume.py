@@ -52,6 +52,10 @@ _CLOSE_TAG_RE = {
     "manifest": re.compile(r"</(?:[\w.-]+:)?manifest\s*>", re.I),
     "spine": re.compile(r"</(?:[\w.-]+:)?spine\s*>", re.I),
 }
+_SELF_CLOSING_TAG_RE = {
+    "manifest": re.compile(r"<((?:[\w.-]+:)?manifest)(\b[^<>]*?)/\s*>", re.I),
+    "spine": re.compile(r"<((?:[\w.-]+:)?spine)(\b[^<>]*?)/\s*>", re.I),
+}
 
 
 def _skip_text(text: str) -> bool:
@@ -633,10 +637,21 @@ def _start_tag_re(tag: str, attr: str, value: str) -> re.Pattern[str]:
     )
 
 
-def _insert_before_close(text: str, tag: str, snippet: str) -> str:
+def _insert_before_close(
+    text: str, tag: str, snippet: str, log: Callable[[str], None] = print
+) -> str:
     m = _CLOSE_TAG_RE[tag].search(text)
-    if not m:
-        return text + snippet
+    if m is None:
+        sc = _SELF_CLOSING_TAG_RE[tag].search(text)
+        if sc is not None:
+            # expand <manifest/> into <manifest></manifest> so items go inside
+            expanded = f"<{sc.group(1)}{sc.group(2)}></{sc.group(1)}>"
+            text = text[: sc.start()] + expanded + text[sc.end() :]
+            m = _CLOSE_TAG_RE[tag].search(text)
+    if m is None:
+        # blindly appending would land the snippet after </package>: invalid XML
+        log(f"warning: OPF has no <{tag}> element; skipped inserting {snippet.strip()!r}")
+        return text
     return text[: m.start()] + snippet + text[m.start() :]
 
 
