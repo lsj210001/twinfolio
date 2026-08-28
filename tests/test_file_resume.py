@@ -636,6 +636,140 @@ def test_resume_only_and_retranslate(tmp_path):
     assert "中文（Neural" in _read(out, "EPUB/Text/beta.xhtml")
 
 
+def _english_chat(prompt, **kwargs):
+    """Broken LLM: answers numbered lists with English paraphrases, never Chinese."""
+    lines = [
+        f"{m.group(1)}. English paraphrase number {m.group(1)} here."
+        for m in _ITEM_RE.finditer(prompt)
+    ]
+    return "\n".join(lines) if lines else "An English paraphrase only."
+
+
+def test_english_reply_is_not_inserted_and_file_is_retried(tmp_path):
+    """A pass whose model answers in English must insert nothing, stay off the
+    done list, and be retried (with real LLM calls) by the next run."""
+    src = _make_src(tmp_path)
+    base = tmp_path / "base.epub"
+    shutil.copy2(src, base)
+    out = tmp_path / "out.epub"
+    state = tmp_path / "resume-done.json"
+
+    _path, done = file_resume.resume_missing(
+        src, base, out, client=StubClient(_english_chat), log=lambda m: None, state_path=state
+    )
+    assert done == [], "files with zero insertions must not be marked done"
+    alpha = _read(out, "EPUB/Text/alpha.xhtml")
+    assert "English paraphrase" not in alpha, "EN+EN pair must not land in the book"
+    assert ALPHA_TEXT in alpha
+    assert len(BeautifulSoup(alpha, "html.parser").find_all("p")) == 1
+    data = json.loads(state.read_text(encoding="utf-8"))
+    assert data["done"] == []
+    assert data["attempts"] == {"EPUB/Text/alpha.xhtml": 1, "EPUB/Text/beta.xhtml": 1}
+
+    # next run (base = checkpoint, like the pipeline) retries and heals
+    prompts2: list[str] = []
+
+    def good_chat(prompt, **kwargs):
+        prompts2.append(prompt)
+        return _echo_chat(prompt)
+
+    _path2, done2 = file_resume.resume_missing(
+        src, out, out, client=StubClient(good_chat), log=lambda m: None, state_path=state
+    )
+    assert prompts2, "second run must actually retry the untranslated files"
+    assert set(done2) == {"EPUB/Text/alpha.xhtml", "EPUB/Text/beta.xhtml"}
+    assert "中文（The quick" in _read(out, "EPUB/Text/alpha.xhtml")
+    assert "中文（Neural networks" in _read(out, "EPUB/Text/beta.xhtml")
+    data2 = json.loads(state.read_text(encoding="utf-8"))
+    assert set(data2["done"]) == set(done2)
+    assert "attempts" not in data2, "healed files must not keep attempt counters"
+
+
+def test_futile_file_gives_up_after_max_attempts(tmp_path):
+    """A stubborn file stops burning tokens: after MAX_FILE_ATTEMPTS futile
+    passes it is marked done and later runs skip it entirely."""
+    src = _make_src(tmp_path)
+    base = tmp_path / "base.epub"
+    shutil.copy2(src, base)
+    out = tmp_path / "out.epub"
+    state = tmp_path / "resume-done.json"
+    calls = {"n": 0}
+
+    def english(prompt, **kwargs):
+        calls["n"] += 1
+        return _english_chat(prompt)
+
+    client = StubClient(english)
+    cur = base
+    done: list[str] = []
+    for _ in range(file_resume.MAX_FILE_ATTEMPTS):
+        _path, done = file_resume.resume_missing(
+            src, cur, out, client=client, log=lambda m: None, state_path=state
+        )
+        cur = out
+    assert set(done) == {"EPUB/Text/alpha.xhtml", "EPUB/Text/beta.xhtml"}
+    data = json.loads(state.read_text(encoding="utf-8"))
+    assert data["attempts"] == {
+        "EPUB/Text/alpha.xhtml": file_resume.MAX_FILE_ATTEMPTS,
+        "EPUB/Text/beta.xhtml": file_resume.MAX_FILE_ATTEMPTS,
+    }
+
+    before = calls["n"]
+    _path, done2 = file_resume.resume_missing(
+        src, out, out, client=client, log=lambda m: None, state_path=state
+    )
+    assert calls["n"] == before, "given-up files must not trigger any LLM call"
+    assert set(done2) == set(done)
+
+
+def test_english_reply_does_not_enter_rolling_context():
+    """An English answer must not seed the ZH context; a Chinese one must."""
+    prompts: list[str] = []
+    replies = iter(
+        [
+            "1. An English paraphrase, not a translation.",
+            "1. 中文（第二段的译文内容）",
+            "1. 中文（第三段的译文内容）",
+        ]
+    )
+
+    def fake(prompt, **kwargs):
+        prompts.append(prompt)
+        return next(replies)
+
+    html = (
+        "<html><body>"
+        "<p>The quick brown fox jumps over the lazy dog today.</p>"
+        "<p>Neural networks consist of many layers of neurons.</p>"
+        "<p>Another english paragraph lives in this third block.</p>"
+        "</body></html>"
+    )
+    out = file_resume.translate_html(
+        html,
+        client=StubClient(fake),
+        log=lambda m: None,
+        fname="c.xhtml",
+        batch_size=1,
+        use_context=True,
+        context_paragraphs=2,
+        batch_tokens=50,
+    )
+    assert len(prompts) == 3
+    assert "【上文对照" not in prompts[1], "English reply must not seed the context"
+    assert "【上文对照" in prompts[2], "Chinese reply must enter the context"
+    assert "Neural networks" in prompts[2]
+    assert "中文（第二段的译文内容）" in prompts[2]
+    assert "The quick brown fox" not in prompts[2]
+
+    soup = BeautifulSoup(out, "html.parser")
+    text = soup.get_text()
+    assert "An English paraphrase" not in text
+    assert "中文（第二段的译文内容）" in text
+    assert "中文（第三段的译文内容）" in text
+    ps = soup.find_all("p")
+    assert len(ps) == 5, "3 source paragraphs + 2 inserted translations"
+
+
 def test_resume_test_num_does_not_write_done(tmp_path):
     src = _make_src(tmp_path)
     base = tmp_path / "base.epub"

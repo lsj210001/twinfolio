@@ -46,6 +46,12 @@ SHORT_BATCH = 8
 DEFAULT_BATCH_TOKENS = 1600
 SHORT_BATCH_TOKENS = 600
 DEFAULT_CONTEXT_PARAGRAPHS = 8
+# A real translation carries at least this many CJK chars (same bar as
+# has_zh_follow); anything below is an English paraphrase/refusal, not Chinese.
+MIN_ZH_CHARS = 2
+# Give up on a file after this many passes that inserted no Chinese at all,
+# so a stubborn file cannot burn tokens forever across reruns.
+MAX_FILE_ATTEMPTS = 3
 RESUME_WORKERS_MAX = 4
 _RESUME_CHAT_GAP_SEC = 0.08
 _CLOSE_TAG_RE = {
@@ -600,12 +606,17 @@ def translate_html(
             context=ctx if use_context else None,
         )
         for el, src_text, zh in zip(nodes[start:end], chunk, zhs):
-            if use_context and zh:
+            if not zh or norm(zh) == norm(el.get_text(" ", strip=True)):
+                continue
+            cn, _en = cn_en_counts(zh)
+            if cn < MIN_ZH_CHARS:
+                # the model answered in English; treat as untranslated so the
+                # EN+EN pair never lands in the book or the rolling context
+                continue
+            if use_context:
                 ctx.append((src_text, zh))
                 if len(ctx) > ctx_limit:
                     ctx = ctx[-ctx_limit:]
-            if not zh or norm(zh) == norm(el.get_text(" ", strip=True)):
-                continue
             if has_zh_follow(el):
                 continue
             in_cell = el.name in ("td", "th")
@@ -808,10 +819,18 @@ def _fingerprint(path: Path) -> str:
     return h.hexdigest()
 
 
-def _write_state(state_path: Path, base: Path, done: list[str], src: Path | None = None) -> None:
+def _write_state(
+    state_path: Path,
+    base: Path,
+    done: list[str],
+    src: Path | None = None,
+    attempts: dict[str, int] | None = None,
+) -> None:
     payload: dict = {"base_sha1": _fingerprint(base), "done": done}
     if src is not None:
         payload["src_sha1"] = _fingerprint(src)
+    if attempts:
+        payload["attempts"] = attempts
     tmp = state_path.with_name(state_path.name + ".tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     os.replace(tmp, state_path)
@@ -850,8 +869,12 @@ def resume_missing(
     """Translate leftover source HTML files and splice them into bilingual EPUB.
 
     Completion is judged from content (missing_files); the done list only
-    records files already attempted against this exact base (bound via
-    base_sha1) so files that yield no insertions are not retried forever.
+    records files whose pass actually landed Chinese in this exact base
+    (bound via base_sha1). A pass that inserted no Chinese at all (e.g. the
+    model kept answering in English) leaves the file off the done list so a
+    later run retries it; per-file attempts are tracked in the state and after
+    MAX_FILE_ATTEMPTS futile passes the file is marked done anyway so it
+    cannot burn tokens forever.
 
     `workers` defaults to BOOK_TRANSLATE_RESUME_WORKERS (1 = serial). Each
     file is still spliced onto disk before it is marked done.
@@ -865,6 +888,7 @@ def resume_missing(
     write_state = state_path is not None and test_num is None
     todo = select_jobs(src, bilingual, only_files=only_files, retranslate=retranslate)
     done: list[str] = []
+    attempts: dict[str, int] = {}
     if write_state and state_path and state_path.exists():
         try:
             data = json.loads(state_path.read_text(encoding="utf-8"))
@@ -876,11 +900,15 @@ def resume_missing(
             and (not data.get("src_sha1") or data.get("src_sha1") == _fingerprint(src))
         ):
             done = [str(x) for x in data.get("done") or []]
+            raw_attempts = data.get("attempts")
+            if isinstance(raw_attempts, dict):
+                attempts = {str(k): int(v) for k, v in raw_attempts.items() if isinstance(v, int)}
         elif data is not None:
             log("resume state stale or legacy format; ignoring its done list")
     redo = parse_name_list(retranslate)
     done_set = {p for p in done if not job_matches(p, Path(p).name, redo)}
     done = [p for p in done if p in done_set]
+    attempts = {p: n for p, n in attempts.items() if not job_matches(p, Path(p).name, redo)}
     todo = [t for t in todo if t[1] not in done_set]
     log(
         f"file-resume missing={len(todo)} already_done={len(done)} "
@@ -912,6 +940,22 @@ def resume_missing(
             batch_tokens=batch_tokens,
         )
 
+    def _record_result(
+        base: str, src_path: str, new_html: str, log_fn: Callable[[str], None]
+    ) -> None:
+        """Mark done only when Chinese actually landed; count futile passes."""
+        if _zh_block_count(new_html) > 0:
+            done.append(src_path)
+            attempts.pop(src_path, None)
+            return
+        n = attempts.get(src_path, 0) + 1
+        attempts[src_path] = n
+        if n >= MAX_FILE_ATTEMPTS:
+            log_fn(f"resume {base}: no Chinese inserted after {n} attempts; giving up")
+            done.append(src_path)
+        else:
+            log_fn(f"resume {base}: no Chinese inserted; will retry ({n}/{MAX_FILE_ATTEMPTS})")
+
     if workers <= 1:
         current = bilingual
         with zipfile.ZipFile(src) as zs:
@@ -931,9 +975,9 @@ def resume_missing(
                 if remaining is not None:
                     remaining -= n_src if cap is None else min(n_src, cap)
                 else:
-                    done.append(src_path)
+                    _record_result(base, src_path, new_html, log)
                     if write_state and state_path:
-                        _write_state(state_path, out, done, src)
+                        _write_state(state_path, out, done, src, attempts=attempts)
         return out, done
 
     htmls: dict[str, str] = {}
@@ -974,9 +1018,9 @@ def resume_missing(
                         progress(f"resume:{base} {len(done) + 1}/{len(todo)}")
                     splice(current[0], {dest: new_html}, out, order_dests=order_dests)
                     current[0] = out
-                    done.append(src_path)
+                    _record_result(base, src_path, new_html, tlog)
                     if write_state and state_path:
-                        _write_state(state_path, out, done, src)
+                        _write_state(state_path, out, done, src, attempts=attempts)
     finally:
         throttle.min_interval = prev_gap
     if errors:
