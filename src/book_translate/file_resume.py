@@ -45,7 +45,7 @@ DEFAULT_BATCH = 12
 SHORT_BATCH = 8
 DEFAULT_BATCH_TOKENS = 1600
 SHORT_BATCH_TOKENS = 600
-DEFAULT_CONTEXT_PARAGRAPHS = 8
+DEFAULT_CONTEXT_PARAGRAPHS = 2
 RESUME_WORKERS_MAX = 4
 _RESUME_CHAT_GAP_SEC = 0.08
 _CLOSE_TAG_RE = {
@@ -475,6 +475,26 @@ def _format_context(pairs: list[tuple[str, str]]) -> str:
     return "\n".join(lines) + "\n\n"
 
 
+BATCH_MAX_TOKENS_MIN = 800
+BATCH_MAX_TOKENS_CAP = 8000
+_STRICT_FORMAT_REMINDER = (
+    "【严格格式】只输出编号列表，每行一条，形如「1. 译文」；"
+    "不要加粗、不要项目符号、不要多余说明。\n\n"
+)
+
+
+def batch_max_tokens(items: list[str]) -> int:
+    """Output budget sized from the batch's *input*, not a flat per-item guess.
+
+    Chinese output roughly matches the English input in tokens, so a flat
+    180/item systematically truncated long paragraphs (then paid double for
+    the length-bump retry). 1.5x the source estimate plus small per-item and
+    fixed overheads, clamped to [800, 8000].
+    """
+    est = estimate_tokens("\n".join(items))
+    return max(BATCH_MAX_TOKENS_MIN, min(BATCH_MAX_TOKENS_CAP, int(1.5 * est) + 30 * len(items) + 200))
+
+
 def _translate_batch(
     client: LlmClient,
     items: list[str],
@@ -494,13 +514,33 @@ def _translate_batch(
         "1. 译文\n2. 译文\n"
         "只输出编号列表，不要解释，不要合并或拆分段落。\n\n" + "\n".join(lines)
     )
+    source = "\n".join(items)
+    max_tokens = batch_max_tokens(items)
+
+    def _cache_ok(content: str) -> bool:
+        # A reply no item can be parsed from must never be cached: a later
+        # run would hit it again and stay pinned to the per-item fallback.
+        return bool(parse_numbered_lines(content, expect=len(items)))
+
     raw = client.chat(
         prompt,
-        max_tokens=min(8000, 180 * len(items) + 400),
+        max_tokens=max_tokens,
         timeout=90,
-        source="\n".join(items),
+        source=source,
+        cache_ok=_cache_ok,
     )
-    parsed = parse_numbered_lines(raw)
+    parsed = parse_numbered_lines(raw, expect=len(items))
+    if not parsed and len(items) > 1:
+        # one whole-batch retry with a strict format reminder before the
+        # per-item fallback multiplies the request count
+        raw = client.chat(
+            _STRICT_FORMAT_REMINDER + prompt,
+            max_tokens=max_tokens,
+            timeout=90,
+            source=source,
+            cache_ok=_cache_ok,
+        )
+        parsed = parse_numbered_lines(raw, expect=len(items))
     out: list[str] = []
     for i, src in enumerate(items, 1):
         zh = parsed.get(i, "")

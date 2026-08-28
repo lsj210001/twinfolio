@@ -360,6 +360,7 @@ class LlmClient:
         retries: int = 3,
         log: Callable[[str], None] | None = None,
         source: str = "",
+        cache_ok: Callable[[str], bool] | None = None,
     ) -> str:
         """One-shot chat completion with jittered exponential-backoff retries.
 
@@ -374,6 +375,8 @@ class LlmClient:
 
         `self.cache` is a paragraph-level store keyed by sha1(model + prompt +
         normalized source). Changing the model or prompt is a miss.
+        `cache_ok`, when given, must approve the reply before it is cached,
+        so callers can keep unparseable replies from pinning future runs.
         """
         model = self.config.model
         if self.cache is not None:
@@ -403,7 +406,12 @@ class LlmClient:
                     except Exception as e:  # noqa: BLE001 - keep the first answer
                         if log:
                             log(f"chat length-bump retry failed, keeping truncated answer: {e}")
-                if self.cache is not None and content and finish != "length":
+                if (
+                    self.cache is not None
+                    and content
+                    and finish != "length"
+                    and (cache_ok is None or cache_ok(content))
+                ):
                     self.cache.put(model, prompt, content, source)
                 return content
             except Exception as e:  # noqa: BLE001 - classified below

@@ -166,6 +166,80 @@ def test_translate_batch_number_variants_and_multiline():
     assert calls[1]["max_tokens"] >= 1000
 
 
+def test_batch_max_tokens_scales_with_input_and_clamps():
+    # tiny batch: floor keeps short replies from ever being truncated
+    assert file_resume.batch_max_tokens(["Short line."]) == 800
+    # long batch: budget follows the input estimate, not a flat per-item guess
+    long_items = ["word " * 400] * 4
+    est = file_resume.estimate_tokens("\n".join(long_items))
+    want = int(1.5 * est) + 30 * 4 + 200
+    assert file_resume.batch_max_tokens(long_items) == want
+    assert want > 180 * 4 + 400, "long batches must get more than the old flat budget"
+    # cap
+    assert file_resume.batch_max_tokens(["x" * 40000] * 4) == 8000
+
+
+def test_translate_batch_sends_input_sized_max_tokens():
+    items = ["word " * 400] * 4
+    calls: list[dict] = []
+
+    def fake(prompt, **kwargs):
+        calls.append(kwargs)
+        return "\n".join(f"{i}. 中文" for i in range(1, 5))
+
+    out = file_resume._translate_batch(StubClient(fake), items)
+    assert out == ["中文"] * 4
+    assert calls[0]["max_tokens"] == file_resume.batch_max_tokens(items)
+    assert calls[0]["max_tokens"] >= 3000
+
+
+def test_translate_batch_zero_parse_retries_with_strict_reminder():
+    items = ["alpha text one", "beta text two"]
+    prompts: list[str] = []
+    responses = iter(["抱歉，我无法按要求输出。", "1. 译文一\n2. 译文二"])
+
+    def fake(prompt, **kwargs):
+        prompts.append(prompt)
+        return next(responses)
+
+    out = file_resume._translate_batch(StubClient(fake), items)
+    assert out == ["译文一", "译文二"]
+    assert len(prompts) == 2, "one whole-batch retry, no per-item fallback needed"
+    assert prompts[1] == file_resume._STRICT_FORMAT_REMINDER + prompts[0]
+
+
+def test_unparseable_batch_reply_is_not_cached(tmp_path, monkeypatch):
+    from book_translate.llm import LlmCache
+
+    cache = LlmCache(tmp_path / "cache.jsonl")
+    seen: list[str] = []
+
+    def fake_once(self, body, timeout):
+        prompt = body["messages"][0]["content"]
+        seen.append(prompt)
+        if prompt.startswith("把这段英文"):
+            return "单段译文", "stop"
+        return "抱歉，我无法翻译。", "stop"
+
+    monkeypatch.setattr(LlmClient, "_chat_once", fake_once)
+    client = LlmClient(CFG, cache=cache)
+    items = ["alpha text one", "beta text two"]
+    out = file_resume._translate_batch(client, items)
+    assert out == ["单段译文", "单段译文"]
+    # batch call + strict retry + two per-item fallbacks
+    assert len(seen) == 4
+    src = "\n".join(items)
+    assert cache.get("m", seen[0], src) is None, "zero-parse reply must not pin the cache"
+    assert cache.get("m", seen[1], src) is None
+    # the per-item fallback replies are still cached
+    assert cache.get("m", seen[2], items[0]) == "单段译文"
+    assert cache.get("m", seen[3], items[1]) == "单段译文"
+
+
+def test_default_context_paragraphs_is_two():
+    assert file_resume.DEFAULT_CONTEXT_PARAGRAPHS == 2
+
+
 def test_insertion_keeps_structure_and_ids_unique():
     """M6: td/ol-li get in-place <br/>+译文; copied blocks drop their id."""
     html = (

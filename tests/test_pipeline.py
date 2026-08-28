@@ -73,6 +73,32 @@ def test_translate_uses_file_resume_not_bbook(tmp_path, monkeypatch):
     assert not hasattr(pipeline, "_bbm_bin")
 
 
+def test_translate_default_context_paragraphs_is_two(tmp_path, monkeypatch):
+    src = _tiny_epub(tmp_path / "book.epub")
+    seen: dict[str, object] = {}
+
+    def fake_resume(src_epub, bilingual, resumed, **kwargs):
+        seen["context_paragraphs"] = kwargs.get("context_paragraphs")
+        shutil.copy2(bilingual, resumed)
+        return resumed, []
+
+    monkeypatch.setattr(file_resume, "resume_missing", fake_resume)
+    monkeypatch.setattr(
+        pipeline, "fix_english_titles", lambda epub, out_path, **k: shutil.copy2(epub, out_path)
+    )
+    monkeypatch.setattr(
+        pipeline, "dedupe_epub", lambda src_epub, dest: shutil.copy2(src_epub, dest) or 0
+    )
+    monkeypatch.setattr(pipeline, "repair_epub_toc", lambda p: None)
+    monkeypatch.setenv("OPENAI_API_KEY", "k")
+
+    pipeline.translate(src, tmp_path / "out1", bilingual_only=True)
+    assert seen["context_paragraphs"] == 2, "unset context size must default to 2"
+
+    pipeline.translate(src, tmp_path / "out2", bilingual_only=True, context_paragraphs=6)
+    assert seen["context_paragraphs"] == 6, "an explicit context size must be kept"
+
+
 def test_translate_test_mode_skips_titles_and_writes_sample(tmp_path, monkeypatch):
     src = _tiny_epub(tmp_path / "book.epub")
     called = {"titles": 0}
